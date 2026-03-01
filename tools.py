@@ -1,0 +1,46 @@
+import pandas as pd
+from typing import Any
+from langchain_core.tools import tool
+import json
+
+# Global reference to the current dataframe for tools to use
+# (In a production app, we could pass this via Runnable binding or custom tool creation)
+_CURRENT_DF = None
+
+def set_current_df(df: pd.DataFrame):
+    global _CURRENT_DF
+    _CURRENT_DF = df
+
+@tool
+def pandas_query_tool(query: str) -> str:
+    """
+    Executes a pandas query on the dataset to check for logical consistency and constraints.
+    Provide a valid pandas `.query()` string. 
+    Returns a JSON string containing the count of rows matching the condition and a sample of matching rows.
+    
+    Examples:
+    - query: "flow_rate < 0" -> Checks if there are any rows with negative flow rate.
+    - query: "start_date > end_date" -> Checks if start_date is after end_date.
+    - query: "dosing_rate < 0" -> Checks if dosing rate is negative.
+    """
+    global _CURRENT_DF
+    if _CURRENT_DF is None:
+        return "Error: No dataframe loaded."
+    
+    try:
+        # We cap the returned sample to 5 rows to avoid huge outputs
+        result_df = _CURRENT_DF.query(query)
+        match_count = len(result_df)
+        sample = result_df.head(5).to_dict(orient="records")
+        
+        return json.dumps({
+            "success": True,
+            "query": query,
+            "match_count": match_count,
+            "sample_matches": sample
+        })
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "error": str(e)
+        })

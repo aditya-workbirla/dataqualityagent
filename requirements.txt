@@ -1,0 +1,7 @@
+pandas
+openpyxl
+langgraph
+langchain
+langchain-core
+langchain-google-genai
+python-dotenv
