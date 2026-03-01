@@ -4,10 +4,12 @@ from langchain_core.tools import tool
 import json
 
 # Global reference to the current dataframe for tools to use
-# (In a production app, we could pass this via Runnable binding or custom tool creation)
+# (In a production app, we would pass this dataframe via LangChain Runnable binding 
+# or custom tool creation, but a global variable is simple for this script)
 _CURRENT_DF = None
 
 def set_current_df(df: pd.DataFrame):
+    """Stores the active dataframe so the `pandas_query_tool` can query against it."""
     global _CURRENT_DF
     _CURRENT_DF = df
 
@@ -28,9 +30,11 @@ def pandas_query_tool(query: str) -> str:
         return "Error: No dataframe loaded."
     
     try:
-        # We cap the returned sample to 5 rows to avoid huge outputs
+        # Use pandas `.query()` to execute the string condition the LLM generated
         result_df = _CURRENT_DF.query(query)
         match_count = len(result_df)
+        
+        # We cap the returned sample to 5 rows to avoid blowing up the LLM's context window
         sample = result_df.head(5).to_dict(orient="records")
         
         return json.dumps({

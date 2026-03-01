@@ -8,11 +8,12 @@ import operator
 from data_profiler import profile_dataframe
 from tools import pandas_query_tool, set_current_df
 
-# Define the state type
+# Define the LangGraph State type
+# This state dictionary is passed between every node in the graph.
 class AgentState(TypedDict):
     df: pd.DataFrame
     profile: Dict[str, Any]
-    messages: Annotated[List[Any], operator.add]
+    messages: Annotated[List[Any], operator.add]   # Use operator.add so messages append instead of overwrite
     issues: List[str]
     report: str
 
@@ -45,25 +46,29 @@ def format_gemini_messages(messages):
 
 def profile_data_node(state: AgentState) -> AgentState:
     """
-    Node 1: Gather basic profiling data.
+    Node 1: Data Profiling
+    This node takes the raw dataframe, runs the basic statistical profiling function, 
+    and saves the profile to the state to pass to the LLM later.
     """
     df = state["df"]
     profile = profile_dataframe(df)
     
-    # Store df so tool can access it
+    # Store df globally so the pandas query tool can access it when the LLM calls it
     set_current_df(df)
     
     return {"profile": profile}
 
 def quality_analyst_node(state: AgentState) -> AgentState:
     """
-    Node 2: The LLM analyzes the data profile, queries the data,
-    and identifies logical inconsistencies and data quality issues.
+    Node 2: LLM Analysis
+    The core AI node. It reviews the data profile, actively reasons about logical constraints based 
+    on column names, and identifies specific issues using the pandas query tool.
     """
     profile = state["profile"]
     messages = state.get("messages", [])
     df = state["df"]
     
+    # Initialize the Google Gemini model and bind our custom Pandas query tool to it
     llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
     llm_with_tools = llm.bind_tools([pandas_query_tool])
     
@@ -136,13 +141,16 @@ def should_continue(state: AgentState) -> str:
 
 def generate_report_node(state: AgentState) -> AgentState:
     """
-    Node 4: Generate a clean formatted final report based on everything found.
+    Node 4: Final Summarization
+    This node takes all the raw findings from the AI analyst (tool matches, missing stats, etc.) 
+    and synthesizes them into a polished markdown report for the user.
     """
     messages = state["messages"]
     
     # Grab the final analysis from the LLM
     final_analysis = messages[-1].content
     
+    # Re-initialize the LLM for the final generation task
     llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
     prompt = f"""Based on the following data quality analysis findings, write a clear, professional Data Quality Report.
     The report should have sections for:
@@ -163,18 +171,22 @@ def generate_report_node(state: AgentState) -> AgentState:
 
 def build_data_quality_graph() -> StateGraph:
     """
-    Builds and compiles the LangGraph workflow.
+    Assembles and compiles the LangGraph workflow.
     """
+    # Initialize graph
     workflow = StateGraph(AgentState)
     
+    # Add Nodes
     workflow.add_node("profile_data", profile_data_node)
     workflow.add_node("quality_analyst", quality_analyst_node)
     workflow.add_node("tool_execution", tool_execution_node)
     workflow.add_node("generate_report", generate_report_node)
     
+    # Define execution order
     workflow.set_entry_point("profile_data")
     workflow.add_edge("profile_data", "quality_analyst")
     
+    # Conditional edge: after Analyst, either run a tool or generate the final report
     workflow.add_conditional_edges(
         "quality_analyst",
         should_continue,
@@ -183,6 +195,7 @@ def build_data_quality_graph() -> StateGraph:
             "end": "generate_report"
         }
     )
+    # After a tool runs, ALWAYS return to the Analyst so it can read the result
     workflow.add_edge("tool_execution", "quality_analyst")
     workflow.add_edge("generate_report", END)
     
