@@ -66,6 +66,25 @@ def main():
         # Run graph
         final_state = app.invoke(initial_state)
         report = final_state.get("report")
+        bad_row_indices = final_state.get("bad_row_indices", set())
+        
+        # Add Data_Quality_Status column
+        df['Data_Quality_Status'] = 'Good'
+        if bad_row_indices:
+            # df.index is expected to align with the indices returned by pandas query
+            df.loc[df.index.isin(bad_row_indices), 'Data_Quality_Status'] = 'Bad'
+            
+        # Determine output file path
+        base_name, ext = os.path.splitext(file_path)
+        output_file_path = f"{base_name}_analyzed{ext}"
+        
+        # Save to file
+        if ext.lower() == '.csv':
+            df.to_csv(output_file_path, index=False)
+        else:
+            df.to_excel(output_file_path, index=False)
+            
+        print(f"Analysis complete. Saved annotated data to: {output_file_path}\n")
         
         print("===================================\n")
         print("DATA QUALITY FINAL REPORT")

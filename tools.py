@@ -37,10 +37,14 @@ def pandas_query_tool(query: str) -> str:
         # We cap the returned sample to 5 rows to avoid blowing up the LLM's context window
         sample = result_df.head(5).to_dict(orient="records")
         
+        # Get the indices of the matching rows
+        matched_indices = result_df.index.tolist()
+        
         return json.dumps({
             "success": True,
             "query": query,
             "match_count": match_count,
+            "matched_indices": matched_indices,
             "sample_matches": sample
         })
     except Exception as e:

@@ -15,6 +15,7 @@ class AgentState(TypedDict):
     profile: Dict[str, Any]
     messages: Annotated[List[Any], operator.add]   # Use operator.add so messages append instead of overwrite
     issues: List[str]
+    bad_row_indices: set
     report: str
 
 def format_messages(messages):
@@ -119,6 +120,9 @@ def tool_execution_node(state: AgentState) -> AgentState:
     messages = state["messages"]
     last_message = messages[-1]
     
+    # Initialize bad_row_indices if not present
+    bad_row_indices = state.get("bad_row_indices", set())
+    
     new_messages = []
     for tool_call in last_message.tool_calls:
         try:
@@ -130,6 +134,16 @@ def tool_execution_node(state: AgentState) -> AgentState:
                     "content": result,
                     "tool_call_id": tool_call["id"]
                 })
+                
+                # Parse the result to extract matched_indices
+                try:
+                    import json
+                    result_data = json.loads(result)
+                    if result_data.get("success") and "matched_indices" in result_data:
+                        bad_row_indices.update(result_data["matched_indices"])
+                except Exception as parse_e:
+                    print(f"Failed to parse tool result: {parse_e}")
+                    
         except Exception as e:
                 new_messages.append({
                     "role": "tool",
@@ -138,7 +152,7 @@ def tool_execution_node(state: AgentState) -> AgentState:
                     "tool_call_id": tool_call["id"]
                 })
                 
-    return {"messages": new_messages}
+    return {"messages": new_messages, "bad_row_indices": bad_row_indices}
 
 def should_continue(state: AgentState) -> str:
     """
@@ -158,6 +172,16 @@ def generate_report_node(state: AgentState) -> AgentState:
     and synthesizes them into a polished markdown report for the user.
     """
     messages = state["messages"]
+    df = state["df"]
+    bad_row_indices = state.get("bad_row_indices", set())
+    
+    # Calculate percentages
+    total_rows = len(df)
+    bad_rows_count = len(bad_row_indices)
+    good_rows_count = total_rows - bad_rows_count
+    
+    good_percentage = (good_rows_count / total_rows * 100) if total_rows > 0 else 0
+    bad_percentage = (bad_rows_count / total_rows * 100) if total_rows > 0 else 0
     
     # Grab the final analysis from the LLM
     final_analysis = messages[-1].content
@@ -170,6 +194,11 @@ def generate_report_node(state: AgentState) -> AgentState:
     2. Missing and Repeating Values
     3. Logical Inconsistencies and Invalid Values
     4. Recommendations
+    
+    Wait! Before you begin the sections above, you MUST include a summary of the Good/Bad row breakdown exactly as follows:
+    - **Total Rows**: {total_rows}
+    - **Good Rows**: {good_rows_count} ({good_percentage:.2f}%)
+    - **Bad Rows**: {bad_rows_count} ({bad_percentage:.2f}%)
 
     Other than these sections if you found something important about the data quality that needs to be highlighted please do so.
     
