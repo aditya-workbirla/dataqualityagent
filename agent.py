@@ -2,7 +2,7 @@ import os
 import pandas as pd
 from typing import Dict, Any, List, TypedDict, Annotated
 from langgraph.graph import StateGraph, END
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI, AzureChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 import operator
 from data_profiler import profile_dataframe
@@ -17,16 +17,16 @@ class AgentState(TypedDict):
     issues: List[str]
     report: str
 
-def format_gemini_messages(messages):
+def format_messages(messages):
     """
-    Cleans up the LangGraph message state to strictly comply with Gemini API's 
+    Cleans up the LangGraph message state to strictly comply with LLM API's 
     roles and turn-taking requirements (e.g., no orphaned tool messages).
     """
     cleaned = []
     
     for m in messages:
         if isinstance(m, AIMessage):
-            # fix empty content issue for gemini tool calls
+            # fix empty content issue for tool calls
             if getattr(m, 'tool_calls', None) and not m.content:
                 m.content = 'Calling tool'
             cleaned.append(m)
@@ -43,6 +43,18 @@ def format_gemini_messages(messages):
             cleaned.append(m)
             
     return cleaned
+
+def get_llm():
+    use_azure = os.getenv("USE_AZURE_OPENAI", "false").lower() == "true"
+    if use_azure:
+        return AzureChatOpenAI(
+            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+            api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
+            api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+            azure_deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"),
+            temperature=0
+        )
+    return ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
 def profile_data_node(state: AgentState) -> AgentState:
     """
@@ -68,16 +80,16 @@ def quality_analyst_node(state: AgentState) -> AgentState:
     messages = state.get("messages", [])
     df = state["df"]
     
-    # Initialize the Google Gemini model and bind our custom Pandas query tool to it
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+    # Initialize the LLM (Azure or Standard) and bind our custom Pandas query tool to it
+    llm = get_llm()
     llm_with_tools = llm.bind_tools([pandas_query_tool])
     
-    system_prompt = f"""You are an expert Data Quality Analyst API. Your job is to analyze the profile of a dataset and find issues.
-    You will be provided with a profile summary containing missing value percentages, repeating value percentages, and basic stats per column.
+    system_prompt = f"""You are an expert Data Quality Analyst. Your job is to analyze the profile of a dataset and find issues.
+    You will be provided with a profile summary containing missing value percentages, consecutive repeating value percentages, and basic stats per column.
     
     You need to:
-    1. Identify columns with high percentages (>20%) of missing values.
-    2. Identify columns with high percentages (>50%) of repeating values.
+    1. Identify columns with high percentages (>15%) of missing values.
+    2. Identify columns with high percentages (>30%) of consecutive repeating values (i.e. fixed or duplicate consecutive records).
     3. Reason about the physics and logic of the variables based on their names. 
         For example: 'Flow Rate' or 'Dosing Rate' cannot be negative. 'Age' must be between 0 and 120, etc.
     4. You MUST use the `pandas_query_tool` to check the dataset for rows violating these logical constraints.
@@ -95,7 +107,7 @@ def quality_analyst_node(state: AgentState) -> AgentState:
     if not messages:
         messages = [SystemMessage(content=system_prompt), HumanMessage(content="Please analyze the data profile and use your tools to find any logical inconsistencies. When you are done, list all identified data quality issues.")]
         
-    cleaned_messages = format_gemini_messages(messages)
+    cleaned_messages = format_messages(messages)
     response = llm_with_tools.invoke(cleaned_messages)
     
     return {"messages": [response]}
@@ -151,13 +163,15 @@ def generate_report_node(state: AgentState) -> AgentState:
     final_analysis = messages[-1].content
     
     # Re-initialize the LLM for the final generation task
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+    llm = get_llm()
     prompt = f"""Based on the following data quality analysis findings, write a clear, professional Data Quality Report.
     The report should have sections for:
     1. Executive Summary
     2. Missing and Repeating Values
     3. Logical Inconsistencies and Invalid Values
     4. Recommendations
+
+    Other than these sections if you found something important about the data quality that needs to be highlighted please do so.
     
     Make it easy to read for a team member who just uploaded their file.
 

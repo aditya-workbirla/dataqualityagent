@@ -26,14 +26,11 @@ def profile_dataframe(df: pd.DataFrame) -> Dict[str, Any]:
         # Convert the count into a percentage out of 100 for easier reading
         missing_percentage = (missing_count / total_rows * 100) if total_rows > 0 else 0
         
-        # Check for repeating values by finding the "mode" (most frequent value)
-        if not col_data.mode().empty:
-            most_common_val = col_data.mode().iloc[0]
-            # Count the number of times the mode value appears in the column
-            repeating_count = (col_data == most_common_val).sum()
-            repeating_percentage = (repeating_count / total_rows * 100) if total_rows > 0 else 0
+        # Check for consecutive repeating values (val == previous_val)
+        if total_rows > 1:
+            consecutive_repeating_count = (col_data == col_data.shift(1)).sum()
+            repeating_percentage = (consecutive_repeating_count / total_rows * 100)
         else:
-            most_common_val = None
             repeating_percentage = 0
             
         # Basic summary stats for numeric columns only
@@ -49,7 +46,7 @@ def profile_dataframe(df: pd.DataFrame) -> Dict[str, Any]:
         profile["columns"][col] = {
             "dtype": dtype_str,
             "missing_percentage": round(float(missing_percentage), 2),
-            "most_common_value_percentage": round(float(repeating_percentage), 2),
+            "consecutive_repeating_percentage": round(float(repeating_percentage), 2),
             "is_numeric": is_numeric,
         }
         

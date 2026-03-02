@@ -37,11 +37,18 @@ def main():
         
     print("Initializing Data Quality Agent...")
     
-    # We need a google API key setup to run langgraph (Gemini)
-    if "GOOGLE_API_KEY" not in os.environ:
-        print("Warning: GOOGLE_API_KEY environment variable not found.")
-        print("Please set it to run the analysis.")
-        sys.exit(1)
+    # We need an API key setup to run langgraph
+    use_azure = os.getenv("USE_AZURE_OPENAI", "false").lower() == "true"
+    if use_azure:
+        if "AZURE_OPENAI_API_KEY" not in os.environ:
+            print("Warning: AZURE_OPENAI_API_KEY environment variable not found.")
+            print("Please set it in your .env to run the analysis with Azure OpenAI.")
+            sys.exit(1)
+    else:
+        if "OPENAI_API_KEY" not in os.environ:
+            print("Warning: OPENAI_API_KEY environment variable not found.")
+            print("Please set it in your .env to run the analysis.")
+            sys.exit(1)
         
     app = build_data_quality_graph()
     
