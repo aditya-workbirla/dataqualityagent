@@ -138,7 +138,9 @@ def tool_execution_node(state: AgentState) -> AgentState:
                 # Parse the result to extract matched_indices
                 try:
                     import json
-                    result_data = json.loads(result)
+                    # Depending on LangChain version, result could be a ToolMessage or a string
+                    content_str = result.content if hasattr(result, "content") else result
+                    result_data = json.loads(content_str)
                     if result_data.get("success") and "matched_indices" in result_data:
                         bad_row_indices.update(result_data["matched_indices"])
                 except Exception as parse_e:
