@@ -46,7 +46,7 @@ def pandas_query_tool(query: str) -> str:
             "match_count": match_count,
             "matched_indices": matched_indices,
             "sample_matches": sample
-        })
+        }, default=str)
     except Exception as e:
         return json.dumps({
             "success": False,
