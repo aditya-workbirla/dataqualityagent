@@ -15,7 +15,7 @@ class AgentState(TypedDict):
     profile: Dict[str, Any]
     messages: Annotated[List[Any], operator.add]   # Use operator.add so messages append instead of overwrite
     issues: List[str]
-    bad_row_indices: set
+    bad_indices_per_column: dict
     report: str
 
 def format_messages(messages):
@@ -93,8 +93,10 @@ def quality_analyst_node(state: AgentState) -> AgentState:
     2. Identify columns with high percentages (>30%) of consecutive repeating values (i.e. fixed or duplicate consecutive records).
     3. Reason about the physics and logic of the variables based on their names. 
         For example: 'Flow Rate' or 'Dosing Rate' cannot be negative. 'Age' must be between 0 and 120, etc.
+        IMPORTANT: Pay attention to physical reality! For example, 'Temperature' and 'Pressure' CAN legitimately be negative in some contexts. Do not flag negative temperatures or pressures as anomalies.
     4. You MUST use the `pandas_query_tool` to check the dataset for rows violating these logical constraints.
         Provide a pandas query string to the tool representing the error case (e.g. "flow_rate < 0" or "Dosing_Rate < 0"). Notice if the columns have spaces, pandas usually expects backticks for spaces like "`Dosing Rate` < 0".
+        IMPORTANT: You MUST also provide the `target_column` argument to the tool to indicate which specific column you are checking.
     
     If the tool returns matches, log them as a specific data quality issue.
     
@@ -120,8 +122,8 @@ def tool_execution_node(state: AgentState) -> AgentState:
     messages = state["messages"]
     last_message = messages[-1]
     
-    # Initialize bad_row_indices if not present
-    bad_row_indices = state.get("bad_row_indices", set())
+    # Initialize bad_indices_per_column if not present
+    bad_indices_per_column = state.get("bad_indices_per_column", {})
     
     new_messages = []
     for tool_call in last_message.tool_calls:
@@ -142,7 +144,11 @@ def tool_execution_node(state: AgentState) -> AgentState:
                     content_str = result.content if hasattr(result, "content") else result
                     result_data = json.loads(content_str)
                     if result_data.get("success") and "matched_indices" in result_data:
-                        bad_row_indices.update(result_data["matched_indices"])
+                        target_col = result_data.get("target_column")
+                        if target_col:
+                            if target_col not in bad_indices_per_column:
+                                bad_indices_per_column[target_col] = set()
+                            bad_indices_per_column[target_col].update(result_data["matched_indices"])
                 except Exception as parse_e:
                     print(f"Failed to parse tool result: {parse_e}")
                     
@@ -154,7 +160,7 @@ def tool_execution_node(state: AgentState) -> AgentState:
                     "tool_call_id": tool_call["id"]
                 })
                 
-    return {"messages": new_messages, "bad_row_indices": bad_row_indices}
+    return {"messages": new_messages, "bad_indices_per_column": bad_indices_per_column}
 
 def should_continue(state: AgentState) -> str:
     """
@@ -175,15 +181,19 @@ def generate_report_node(state: AgentState) -> AgentState:
     """
     messages = state["messages"]
     df = state["df"]
-    bad_row_indices = state.get("bad_row_indices", set())
+    bad_indices_per_column = state.get("bad_indices_per_column", {})
     
-    # Calculate percentages
+    # Calculate percentages per column
     total_rows = len(df)
-    bad_rows_count = len(bad_row_indices)
-    good_rows_count = total_rows - bad_rows_count
-    
-    good_percentage = (good_rows_count / total_rows * 100) if total_rows > 0 else 0
-    bad_percentage = (bad_rows_count / total_rows * 100) if total_rows > 0 else 0
+    breakdown_lines = [f"- **Total Rows**: {total_rows}"]
+    for col in df.columns:
+        bad_count = 0
+        if col in bad_indices_per_column:
+            bad_count = len(bad_indices_per_column[col])
+        bad_percentage = (bad_count / total_rows * 100) if total_rows > 0 else 0
+        breakdown_lines.append(f"- **{col}**: {bad_percentage:.2f}% bad values")
+        
+    breakdown_summary = "\n".join(breakdown_lines)
     
     # Grab the final analysis from the LLM
     final_analysis = messages[-1].content
@@ -197,11 +207,12 @@ def generate_report_node(state: AgentState) -> AgentState:
     3. Logical Inconsistencies and Invalid Values
     4. Recommendations
     
-    Wait! Before you begin the sections above, you MUST include a summary of the Good/Bad row breakdown exactly as follows:
-    - **Total Rows**: {total_rows}
-    - **Good Rows**: {good_rows_count} ({good_percentage:.2f}%)
-    - **Bad Rows**: {bad_rows_count} ({bad_percentage:.2f}%)
+    Wait! Before you begin the sections above, you MUST include a summary of the Bad Values breakdown per column exactly as follows:
+    **Summary of Bad Values per Column:**
+    {breakdown_summary}
 
+    IMPORTANT: For section "3. Logical Inconsistencies and Invalid Values", you MUST present the findings as a Markdown table. The table should have exactly two columns: "Variable Name" and "Inconsistencies Found". Do not use a numbered list for this section.
+    
     Other than these sections if you found something important about the data quality that needs to be highlighted please do so.
     
     Make it easy to read for a team member who just uploaded their file.

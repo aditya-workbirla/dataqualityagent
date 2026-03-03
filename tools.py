@@ -14,16 +14,16 @@ def set_current_df(df: pd.DataFrame):
     _CURRENT_DF = df
 
 @tool
-def pandas_query_tool(query: str) -> str:
+def pandas_query_tool(query: str, target_column: str = None) -> str:
     """
     Executes a pandas query on the dataset to check for logical consistency and constraints.
     Provide a valid pandas `.query()` string. 
     Returns a JSON string containing the count of rows matching the condition and a sample of matching rows.
     
     Examples:
-    - query: "flow_rate < 0" -> Checks if there are any rows with negative flow rate.
-    - query: "start_date > end_date" -> Checks if start_date is after end_date.
-    - query: "dosing_rate < 0" -> Checks if dosing rate is negative.
+    - query: "flow_rate < 0", target_column: "flow_rate" -> Checks if there are any rows with negative flow rate.
+    - query: "start_date > end_date", target_column: "start_date" -> Checks if start_date is after end_date.
+    - query: "dosing_rate < 0", target_column: "dosing_rate" -> Checks if dosing rate is negative.
     """
     global _CURRENT_DF
     if _CURRENT_DF is None:
@@ -43,6 +43,7 @@ def pandas_query_tool(query: str) -> str:
         return json.dumps({
             "success": True,
             "query": query,
+            "target_column": target_column,
             "match_count": match_count,
             "matched_indices": matched_indices,
             "sample_matches": sample

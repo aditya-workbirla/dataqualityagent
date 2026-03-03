@@ -80,20 +80,14 @@ if uploaded_file is not None:
                     profile={},
                     messages=[],
                     issues=[],
-                    bad_row_indices=set(),
+                    bad_indices_per_column={},
                     report=""
                 )
                 
                 # Run the Agent
                 final_state = app.invoke(initial_state)
                 report = final_state.get("report", "No report generated.")
-                bad_row_indices = final_state.get("bad_row_indices", set())
                 
-                # Append Quality Status
-                df['Data_Quality_Status'] = 'Good'
-                if bad_row_indices:
-                    df.loc[df.index.isin(bad_row_indices), 'Data_Quality_Status'] = 'Bad'
-                    
                 st.session_state["report"] = report
                 st.session_state["annotated_df"] = df
                 st.session_state["analysis_done"] = True
@@ -106,14 +100,13 @@ if st.session_state.get("analysis_done", False):
     st.header("Data Quality Report")
     st.markdown(st.session_state["report"])
     
-    st.header("Annotated Dataset Preview")
-    st.markdown("The `Data_Quality_Status` column has been added to flag problematic rows.")
+    st.header("Analyzed Dataset Preview")
     st.dataframe(st.session_state["annotated_df"])
     
     csv_bytes = convert_df_to_csv(st.session_state["annotated_df"])
     st.download_button(
-        label="Download Annotated Dataset (CSV)",
+        label="Download Dataset (CSV)",
         data=csv_bytes,
-        file_name="annotated_data_quality.csv",
+        file_name="analyzed_data.csv",
         mime="text/csv"
     )
