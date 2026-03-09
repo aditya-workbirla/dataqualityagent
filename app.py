@@ -69,6 +69,11 @@ if uploaded_file is not None:
         st.error(f"Error loading file: {e}")
         st.stop()
 
+    user_context = st.text_area(
+        "Describe your dataset's domain or context (e.g., 'This is data from a Pulp and Fiber plant')", 
+        value="General dataset."
+    )
+
     if st.button("Run Data Quality Analysis"):
         with st.spinner("Agent is analyzing the data (this may take a minute)..."):
             try:
@@ -77,7 +82,8 @@ if uploaded_file is not None:
                 
                 initial_state = AgentState(
                     df=df,
-                    profile={},
+                    user_context_prompt=user_context,
+                    function_results_summary={},
                     messages=[],
                     issues=[],
                     bad_indices_per_column={},

@@ -5,14 +5,15 @@ from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI, AzureChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 import operator
-from data_profiler import profile_dataframe
-from tools import pandas_query_tool, set_current_df
+from functions_db.predefined import run_all_verified_functions
+from tools import generate_and_test_custom_function, set_current_df
 
 # Define the LangGraph State type
 # This state dictionary is passed between every node in the graph.
 class AgentState(TypedDict):
     df: pd.DataFrame
-    profile: Dict[str, Any]
+    user_context_prompt: str
+    function_results_summary: Dict[str, Any]
     messages: Annotated[List[Any], operator.add]   # Use operator.add so messages append instead of overwrite
     issues: List[str]
     bad_indices_per_column: dict
@@ -57,58 +58,57 @@ def get_llm():
         )
     return ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
-def profile_data_node(state: AgentState) -> AgentState:
+def collect_function_results_node(state: AgentState) -> AgentState:
     """
-    Node 1: Data Profiling
-    This node takes the raw dataframe, runs the basic statistical profiling function, 
-    and saves the profile to the state to pass to the LLM later.
+    Node 1: Predefined Function Execution
+    Runs all predefined statistical and quality checks on the raw dataset locally.
     """
     df = state["df"]
-    profile = profile_dataframe(df)
+    summary = run_all_verified_functions(df)
     
-    # Store df globally so the pandas query tool can access it when the LLM calls it
+    # Store df globally so the custom function generator can test it
     set_current_df(df)
     
-    return {"profile": profile}
+    return {"function_results_summary": summary}
 
 def quality_analyst_node(state: AgentState) -> AgentState:
     """
-    Node 2: LLM Analysis
-    The core AI node. It reviews the data profile, actively reasons about logical constraints based 
-    on column names, and identifies specific issues using the pandas query tool.
+    Node 2: LLM Contextual Analysis
+    The core AI node. It reviews the JSON summary of predefined checks, applying 
+    the user's specific context/domain prompt to identify anomalies.
     """
-    profile = state["profile"]
+    summary = state["function_results_summary"]
+    user_context = state.get("user_context_prompt", "No specific context provided.")
     messages = state.get("messages", [])
-    df = state["df"]
     
-    # Initialize the LLM (Azure or Standard) and bind our custom Pandas query tool to it
     llm = get_llm()
-    llm_with_tools = llm.bind_tools([pandas_query_tool])
+    llm_with_tools = llm.bind_tools([generate_and_test_custom_function])
     
-    system_prompt = f"""You are an expert Data Quality Analyst. Your job is to analyze the profile of a dataset and find issues.
-    You will be provided with a profile summary containing missing value percentages, consecutive repeating value percentages, and basic stats per column.
+    system_prompt = f"""You are an expert Data Quality Analyst. Your job is to analyze the output of predefined data quality checks.
+    The user has provided the following context about the data:
+    "{user_context}"
     
     You need to:
-    1. Identify columns with high percentages (>15%) of missing values.
-    2. Identify columns with high percentages (>30%) of consecutive repeating values (i.e. fixed or duplicate consecutive records).
-    3. Reason about the physics and logic of the variables based on their names. 
-        For example: 'Flow Rate' or 'Dosing Rate' cannot be negative. 'Age' must be between 0 and 120, etc.
-        IMPORTANT: Pay attention to physical reality! For example, 'Temperature' and 'Pressure' CAN legitimately be negative in some contexts. Do not flag negative temperatures or pressures as anomalies.
-    4. You MUST use the `pandas_query_tool` to check the dataset for rows violating these logical constraints.
-        Provide a pandas query string to the tool representing the error case (e.g. "flow_rate < 0" or "Dosing_Rate < 0"). Notice if the columns have spaces, pandas usually expects backticks for spaces like "`Dosing Rate` < 0".
-        IMPORTANT: You MUST also provide the `target_column` argument to the tool to indicate which specific column you are checking.
+    1. Review the JSON output of the predefined functions (e.g. missing values, repeating values, outliers, min/max).
+    2. You also need to check if the values are realistic based on the user's context. Don't just highlight missing, repeated, negative values because that would be very surface level. Along with highlighting those, highlight insights about the data quality that are not easy to catch.
+    3. Reason about the physics and logic of the variables *based STRICTLY on the user's context*.
+        For example: If the user context says it's a Pulp and Fiber plant, use your knowledge of that domain to understand if certain values (like negative pressures or temperatures, or specific pH ranges) are realistic. TEMPERATURE CAN BE NEGATIVE, PRESSURE CANNOT BE NEGATIVE.
+    4. If the user context requests a specific check that is NOT covered by the predefined functions (e.g., a specific complex logical constraint), you MUST use the `generate_and_test_custom_function` tool to write a new python function to check for it.
+        CRITICAL RULES FOR GENERATION:
+        - Ensure the function name is GLOBALLY UNIQUE (e.g., append the column name to the function name `check_negative_pressure_blower_inlet`). If you generate the identical function name twice, the database will throw an integrity constraint error!
+        - If the tool execution returns an error like "Function name conflict" or "Database locked", do NOT display that technical error to the user in your output! Instead, internally generate a new unique function name and try again.
     
-    If the tool returns matches, log them as a specific data quality issue.
+    If you use the tool, log the results as a specific data quality issue.
     
-    Do not stop until you have considered all columns and checked potential logical constraints.
-    When you are done, summarize all issues clearly in your final response.
+    Do not stop until you have considered all columns and checked potential logical constraints against the user's context.
+    When you are done, summarize all identified issues clearly in your final response.
     
-    Here is the data profile:
-    {profile}
+    Here is the predefined function results summary:
+    {summary}
     """
     
     if not messages:
-        messages = [SystemMessage(content=system_prompt), HumanMessage(content="Please analyze the data profile and use your tools to find any logical inconsistencies. When you are done, list all identified data quality issues.")]
+        messages = [SystemMessage(content=system_prompt), HumanMessage(content="Please analyze the predefined function results summary using the provided context. If a custom test is needed, generate and run it. List all identified data quality issues.")]
         
     cleaned_messages = format_messages(messages)
     response = llm_with_tools.invoke(cleaned_messages)
@@ -128,8 +128,8 @@ def tool_execution_node(state: AgentState) -> AgentState:
     new_messages = []
     for tool_call in last_message.tool_calls:
         try:
-            if tool_call["name"] == "pandas_query_tool":
-                result = pandas_query_tool.invoke(tool_call)
+            if tool_call["name"] == "generate_and_test_custom_function":
+                result = generate_and_test_custom_function.invoke(tool_call)
                 new_messages.append({
                     "role": "tool",
                     "name": tool_call["name"],
@@ -137,21 +137,8 @@ def tool_execution_node(state: AgentState) -> AgentState:
                     "tool_call_id": tool_call["id"]
                 })
                 
-                # Parse the result to extract matched_indices
-                try:
-                    import json
-                    # Depending on LangChain version, result could be a ToolMessage or a string
-                    content_str = result.content if hasattr(result, "content") else result
-                    result_data = json.loads(content_str)
-                    if result_data.get("success") and "matched_indices" in result_data:
-                        target_col = result_data.get("target_column")
-                        if target_col:
-                            if target_col not in bad_indices_per_column:
-                                bad_indices_per_column[target_col] = set()
-                            bad_indices_per_column[target_col].update(result_data["matched_indices"])
-                except Exception as parse_e:
-                    print(f"Failed to parse tool result: {parse_e}")
-                    
+                # We optionally track metrics from the custom tool result if we want, 
+                # but for now we just feed the LLM the JSON string backward.
         except Exception as e:
                 new_messages.append({
                     "role": "tool",
@@ -180,23 +167,18 @@ def generate_report_node(state: AgentState) -> AgentState:
     and synthesizes them into a polished markdown report for the user.
     """
     messages = state["messages"]
-    df = state["df"]
-    bad_indices_per_column = state.get("bad_indices_per_column", {})
-    
-    # Calculate percentages per column
-    total_rows = len(df)
-    breakdown_lines = [f"- **Total Rows**: {total_rows}"]
-    for col in df.columns:
-        bad_count = 0
-        if col in bad_indices_per_column:
-            bad_count = len(bad_indices_per_column[col])
-        bad_percentage = (bad_count / total_rows * 100) if total_rows > 0 else 0
-        breakdown_lines.append(f"- **{col}**: {bad_percentage:.2f}% bad values")
-        
-    breakdown_summary = "\n".join(breakdown_lines)
+    summary = state.get("function_results_summary", {})
     
     # Grab the final analysis from the LLM
     final_analysis = messages[-1].content
+    
+    # Build text for missing and repeating percentages
+    missing_repeating_text = ""
+    for col, col_data in summary.items():
+        checks = col_data.get("checks", {})
+        missing_pct = checks.get("check_missing_values", {}).get("missing_percentage", 0)
+        repeating_pct = checks.get("check_repeating_values", {}).get("consecutive_repeating_percentage", 0)
+        missing_repeating_text += f"       - **{col}**: {missing_pct}% missing, {repeating_pct}% repeating\n"
     
     # Re-initialize the LLM for the final generation task
     llm = get_llm()
@@ -204,19 +186,13 @@ def generate_report_node(state: AgentState) -> AgentState:
     The report should have sections for:
     1. Executive Summary
     2. Missing and Repeating Values
+       IMPORTANT: You MUST explicitly include the following column-wise percentages for ALL columns in this section:
+{missing_repeating_text}
     3. Logical Inconsistencies and Invalid Values
     4. Recommendations
     
-    Wait! Before you begin the sections above, you MUST include a summary of the Bad Values breakdown per column exactly as follows:
-    **Summary of Bad Values per Column:**
-    {breakdown_summary}
-
     IMPORTANT: For section "3. Logical Inconsistencies and Invalid Values", you MUST present the findings as a Markdown table. The table should have exactly two columns: "Variable Name" and "Inconsistencies Found". Do not use a numbered list for this section.
     
-    Other than these sections if you found something important about the data quality that needs to be highlighted please do so.
-    
-    Make it easy to read for a team member who just uploaded their file.
-
     Analysis Findings:
     {final_analysis}
     """
@@ -233,14 +209,14 @@ def build_data_quality_graph() -> StateGraph:
     workflow = StateGraph(AgentState)
     
     # Add Nodes
-    workflow.add_node("profile_data", profile_data_node)
+    workflow.add_node("collect_function_results", collect_function_results_node)
     workflow.add_node("quality_analyst", quality_analyst_node)
     workflow.add_node("tool_execution", tool_execution_node)
     workflow.add_node("generate_report", generate_report_node)
     
     # Define execution order
-    workflow.set_entry_point("profile_data")
-    workflow.add_edge("profile_data", "quality_analyst")
+    workflow.set_entry_point("collect_function_results")
+    workflow.add_edge("collect_function_results", "quality_analyst")
     
     # Conditional edge: after Analyst, either run a tool or generate the final report
     workflow.add_conditional_edges(

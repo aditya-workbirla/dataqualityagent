@@ -54,7 +54,8 @@ def main():
     
     initial_state = AgentState(
         df=df,
-        profile={},
+        user_context_prompt="General dataset.",
+        function_results_summary={},
         messages=[],
         issues=[],
         bad_indices_per_column={},
