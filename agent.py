@@ -6,7 +6,7 @@ from langchain_openai import ChatOpenAI, AzureChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 import operator
 from functions_db.predefined import run_all_verified_functions
-from tools import generate_and_test_custom_function, set_current_df
+from tools import generate_and_test_custom_function, set_current_df, execute_existing_function_with_params
 
 # Define the LangGraph State type
 # This state dictionary is passed between every node in the graph.
@@ -47,16 +47,26 @@ def format_messages(messages):
     return cleaned
 
 def get_llm():
+    import httpx
     use_azure = os.getenv("USE_AZURE_OPENAI", "false").lower() == "true"
+    
+    # Bypass corporate SSL MITM inspection and broken Windows Registry proxies
+    custom_client = httpx.Client(verify=False, trust_env=False)
+    
     if use_azure:
         return AzureChatOpenAI(
             azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
             api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
             api_key=os.getenv("AZURE_OPENAI_API_KEY"),
             azure_deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"),
-            temperature=0
+            temperature=0,
+            http_client=custom_client
         )
-    return ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    return ChatOpenAI(
+        model="gpt-4o-mini", 
+        temperature=0,
+        http_client=custom_client
+    )
 
 def collect_function_results_node(state: AgentState) -> AgentState:
     """
@@ -82,7 +92,21 @@ def quality_analyst_node(state: AgentState) -> AgentState:
     messages = state.get("messages", [])
     
     llm = get_llm()
-    llm_with_tools = llm.bind_tools([generate_and_test_custom_function])
+    llm_with_tools = llm.bind_tools([generate_and_test_custom_function, execute_existing_function_with_params])
+    
+    # Fetch parameters for Group 2 and 3 functions so LLM knows what to call
+    import sqlite3
+    db_path = "functions.db"
+    advanced_funcs_desc = ""
+    try:
+        with sqlite3.connect(db_path, timeout=5.0) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT function_name, function_description FROM data_quality_functions WHERE approved_by_team = 1 AND function_group IN (2, 3)")
+            funcs = cursor.fetchall()
+            if funcs:
+                advanced_funcs_desc = "\n".join([f"        - {f[0]}: {f[1]}" for f in funcs])
+    except Exception as e:
+        advanced_funcs_desc = f"        - (Could not load from DB: {e})"
     
     system_prompt = f"""You are an expert Data Quality Analyst. Your job is to analyze the output of predefined data quality checks.
     The user has provided the following context about the data:
@@ -97,8 +121,13 @@ def quality_analyst_node(state: AgentState) -> AgentState:
         CRITICAL RULES FOR GENERATION:
         - Ensure the function name is GLOBALLY UNIQUE (e.g., append the column name to the function name `check_negative_pressure_blower_inlet`). If you generate the identical function name twice, the database will throw an integrity constraint error!
         - If the tool execution returns an error like "Function name conflict" or "Database locked", do NOT display that technical error to the user in your output! Instead, internally generate a new unique function name and try again.
+        - DO NOT TRY MORE THAN ONCE per concept. If generation fails repeatedly, move on to avoid getting stuck in a loop.
+    5. The system has several advanced domain physics and statistical functions available (Group 2 and Group 3) that require specific column parameters to run. You MUST use the `execute_existing_function_with_params` tool to run them if they are relevant to the user context.
+        AVAILABLE ADVANCED FUNCTIONS:
+{advanced_funcs_desc}
+        If the function requires a timestamp column, you must provide it in the params dictionary like `{{"timestamp_col": "NameOfColumn"}}`.
     
-    If you use the tool, log the results as a specific data quality issue.
+    If you use any tool, log the results as a specific data quality issue.
     
     Do not stop until you have considered all columns and checked potential logical constraints against the user's context.
     When you are done, summarize all identified issues clearly in your final response.
@@ -136,6 +165,14 @@ def tool_execution_node(state: AgentState) -> AgentState:
                     "content": result,
                     "tool_call_id": tool_call["id"]
                 })
+            elif tool_call["name"] == "execute_existing_function_with_params":
+                result = execute_existing_function_with_params.invoke(tool_call)
+                new_messages.append({
+                    "role": "tool",
+                    "name": tool_call["name"],
+                    "content": result,
+                    "tool_call_id": tool_call["id"]
+                })
                 
                 # We optionally track metrics from the custom tool result if we want, 
                 # but for now we just feed the LLM the JSON string backward.
@@ -156,6 +193,11 @@ def should_continue(state: AgentState) -> str:
     messages = state["messages"]
     last_message = messages[-1]
     
+    # Anti-loop measure
+    tool_message_count = sum(1 for m in messages if isinstance(m, ToolMessage) or (isinstance(m, dict) and m.get("role") == "tool"))
+    if tool_message_count > 10:
+        return "end"
+        
     if getattr(last_message, "tool_calls", None):
         return "continue"
     return "end"
@@ -175,10 +217,20 @@ def generate_report_node(state: AgentState) -> AgentState:
     # Build text for missing and repeating percentages
     missing_repeating_text = ""
     for col, col_data in summary.items():
+        if col == "dataset_checks":
+            continue
         checks = col_data.get("checks", {})
-        missing_pct = checks.get("check_missing_values", {}).get("missing_percentage", 0)
-        repeating_pct = checks.get("check_repeating_values", {}).get("consecutive_repeating_percentage", 0)
+        missing_pct = checks.get("check_missing_values", {}).get("missing_percentage", "N/A")
+        repeating_pct = checks.get("check_repeating_values", {}).get("consecutive_repeating_percentage", "N/A")
         missing_repeating_text += f"       - **{col}**: {missing_pct}% missing, {repeating_pct}% repeating\n"
+        
+    # Extract advanced dataset checks summary
+    dataset_summary = ""
+    dataset_checks = summary.get("dataset_checks", {})
+    for check_name, check_result in dataset_checks.items():
+        ds_msg = check_result.get("summary", "")
+        if ds_msg:
+            dataset_summary += f"       - **{check_name}**: {ds_msg}\n"
     
     # Re-initialize the LLM for the final generation task
     llm = get_llm()
@@ -188,10 +240,13 @@ def generate_report_node(state: AgentState) -> AgentState:
     2. Missing and Repeating Values
        IMPORTANT: You MUST explicitly include the following column-wise percentages for ALL columns in this section:
 {missing_repeating_text}
-    3. Logical Inconsistencies and Invalid Values
-    4. Recommendations
+    3. Advanced Dataset Quality
+       Include these high-level dataset metrics:
+{dataset_summary}
+    4. Logical Inconsistencies and Invalid Values
+    5. Recommendations
     
-    IMPORTANT: For section "3. Logical Inconsistencies and Invalid Values", you MUST present the findings as a Markdown table. The table should have exactly two columns: "Variable Name" and "Inconsistencies Found". Do not use a numbered list for this section.
+    IMPORTANT: For section "4. Logical Inconsistencies and Invalid Values", you MUST present the findings as a Markdown table. The table should have exactly two columns: "Variable Name" and "Inconsistencies Found". Do not use a numbered list for this section.
     
     Analysis Findings:
     {final_analysis}

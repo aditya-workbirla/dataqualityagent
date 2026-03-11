@@ -59,12 +59,13 @@ def generate_and_test_custom_function(function_name: str, code: str, target_colu
                 cursor = conn.cursor()
                 cursor.execute('''
                 INSERT INTO data_quality_functions
-                (function_name, function_code, function_description, approved_by_team, created_at, updated_at, approved_by)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                (function_name, function_code, function_description, function_group, approved_by_team, created_at, updated_at, approved_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     function_name, 
                     code, 
                     function_description, 
+                    4,      # Group 4 for Agent Generated
                     False,  # Unapproved by default
                     now, 
                     now, 
@@ -84,6 +85,58 @@ def generate_and_test_custom_function(function_name: str, code: str, target_colu
             "database_status": "Saved to SQLite (pending team approval)"
         }, default=str)
         
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "error": str(e)
+        })
+
+@tool
+def execute_existing_function_with_params(function_name: str, params: dict) -> str:
+    """
+    Executes a pre-existing advanced data quality function (from Group 2 or Group 3) out of the database on the dataset.
+    Requires passing specific `params` as a dictionary. Example: {"timestamp_col": "date_time", "window_minutes": 15}.
+    Returns a JSON string with the result of the function execution.
+    """
+    global _CURRENT_DF
+    if _CURRENT_DF is None:
+        return "Error: No dataframe loaded."
+        
+    import sqlite3
+    db_path = "functions.db"
+    
+    try:
+        with sqlite3.connect(db_path, timeout=10.0) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT function_code FROM data_quality_functions WHERE function_name = ?", (function_name,))
+            result = cursor.fetchone()
+            
+            if not result:
+                return f"Error: Function '{function_name}' not found in the database."
+                
+            function_code = result[0]
+            
+            # Execute code dynamically to define the function
+            local_scope = {}
+            import pandas as pd
+            from typing import Dict, Any
+            exec_globals = {"pd": pd, "Dict": Dict, "Any": Any}
+            exec(function_code, exec_globals, local_scope)
+            
+            if function_name not in local_scope:
+                return f"Error: Function '{function_name}' was not defined in the code body."
+                
+            func = local_scope[function_name]
+            
+            # Test it on the data
+            res = func(_CURRENT_DF, params)
+            return json.dumps({
+                "success": True,
+                "function_name": function_name,
+                "params_used": params,
+                "result": res
+            }, default=str)
+            
     except Exception as e:
         return json.dumps({
             "success": False,
