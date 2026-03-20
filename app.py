@@ -8,6 +8,9 @@ from agent import build_data_quality_graph, AgentState
 import ui_components
 import kg_builder
 import streamlit.components.v1 as components
+from langgraph.checkpoint.sqlite import SqliteSaver
+import sqlite3
+import uuid
 
 # Load environment variables
 load_dotenv(override=True)
@@ -54,11 +57,91 @@ if "agent_state" not in st.session_state:
     st.session_state["agent_state"] = None
 if "kg_html" not in st.session_state:
     st.session_state["kg_html"] = None
+if "checkpointer" not in st.session_state:
+    conn = sqlite3.connect("checkpoints.db", check_same_thread=False)
+    saver = SqliteSaver(conn)
+    saver.setup()  # Ensures the checkpoints tables are created
+    st.session_state["checkpointer"] = saver
+if "chat_history" not in st.session_state:
+    st.session_state["chat_history"] = []
+if "thread_id" not in st.session_state:
+    st.session_state["thread_id"] = str(uuid.uuid4())
 
 def convert_df_to_csv(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
 
-tab1, tab2, tab3 = st.tabs(["New Analysis", "Functions DB", "Knowledge Graph"])
+# Sidebar Session History
+with st.sidebar:
+    st.header("🗄️ Session History")
+    # Fetch threads from sqlite checkpointer
+    try:
+        with sqlite3.connect("checkpoints.db", timeout=5.0) as cp_conn:
+            cp_cursor = cp_conn.cursor()
+            cp_cursor.execute("SELECT DISTINCT thread_id FROM checkpoints")
+            threads = [row[0] for row in cp_cursor.fetchall() if row[0] != "main_thread"]
+    except Exception:
+        threads = []
+        
+    if threads:
+        thread_names = {"-- New Session --": "-- New Session --"}
+        try:
+            app_for_history = build_data_quality_graph(checkpointer=st.session_state["checkpointer"])
+            for t in threads:
+                config = {"configurable": {"thread_id": t}}
+                state = app_for_history.get_state(config).values
+                if state and "user_context_prompt" in state:
+                    prompt = state["user_context_prompt"].strip().replace('\n', ' ')
+                    name = (prompt[:35] + "...") if len(prompt) > 35 else prompt
+                    if not name:
+                         name = "Empty Prompt"
+                    # Add short UUID tag to differentiate identical prompts
+                    thread_names[t] = f"{name} ({t[:4]})"
+                else:
+                    thread_names[t] = t
+        except Exception:
+            for t in threads: thread_names[t] = t
+            
+        selected_thread = st.selectbox(
+            "Resume Previous Session", 
+            options=["-- New Session --"] + threads,
+            format_func=lambda x: thread_names.get(x, x)
+        )
+        if selected_thread != "-- New Session --" and selected_thread != st.session_state.get("thread_id"):
+            st.session_state["thread_id"] = selected_thread
+            config = {"configurable": {"thread_id": selected_thread}}
+            app = build_data_quality_graph(checkpointer=st.session_state["checkpointer"])
+            saved_state = app.get_state(config).values
+            
+            if saved_state:
+                st.session_state["report"] = saved_state.get("report", "No report generated.")
+                try:
+                    df_json_str = saved_state.get("df_json", "[]")
+                    st.session_state["annotated_df"] = pd.read_json(io.StringIO(df_json_str))
+                except Exception:
+                    st.session_state["annotated_df"] = pd.DataFrame()
+                st.session_state["analysis_done"] = True
+                st.session_state["agent_state"] = saved_state
+                
+                chat_hist = []
+                if "messages" in saved_state:
+                    from langchain_core.messages import HumanMessage, AIMessage
+                    for m in saved_state["messages"]:
+                        if isinstance(m, HumanMessage):
+                            chat_hist.append({"role": "user", "content": m.content})
+                        elif isinstance(m, AIMessage) and m.content:
+                            chat_hist.append({"role": "assistant", "content": m.content})
+                st.session_state["chat_history"] = chat_hist
+                
+                # Rebuild Knowledge Graph since it's not natively in state
+                if st.session_state["annotated_df"] is not None:
+                    try:
+                        st.session_state["kg_html"] = kg_builder.build_knowledge_graph(st.session_state["annotated_df"])
+                    except Exception:
+                        pass
+                
+                st.rerun()
+
+tab1, tab2, tab3, tab4 = st.tabs(["New Analysis", "Functions DB", "Knowledge Graph", "Domain Knowledge Base"])
 
 with tab1:
     st.markdown(ui_components.get_header_html(), unsafe_allow_html=True)
@@ -103,16 +186,22 @@ with tab1:
     if run_button and df is not None:
         with st.spinner("Agent is analyzing the data (this may take a minute)..."):
             try:
-                # Initialize Graph
-                app = build_data_quality_graph()
-                initial_state = AgentState(
-                    df=df, user_context_prompt=user_context,
-                    function_results_summary={}, messages=[],
-                    issues=[], bad_indices_per_column={}, report=""
-                )
+                # Generate a new unique thread for this analysis and wipe old chat history
+                st.session_state["thread_id"] = str(uuid.uuid4())
+                st.session_state["chat_history"] = []
                 
-                # Run the Agent
-                final_state = app.invoke(initial_state)
+                # Initialize Graph explicitly wrapping it in the memory saver checkpointer
+                app = build_data_quality_graph(checkpointer=st.session_state["checkpointer"])
+                config = {"configurable": {"thread_id": st.session_state["thread_id"]}}
+                
+                initial_state = {
+                    "df_json": df.to_json(orient="records"), "user_context_prompt": user_context,
+                    "function_results_summary": {}, "messages": [],
+                    "issues": [], "bad_indices_per_column": {}, "report": ""
+                }
+                
+                # Run the Agent with thread config
+                final_state = app.invoke(initial_state, config)
                 st.session_state["report"] = final_state.get("report", "No report generated.")
                 st.session_state["annotated_df"] = df
                 st.session_state["agent_state"] = final_state
@@ -148,6 +237,33 @@ with tab1:
             file_name="analyzed_data.csv",
             mime="text/csv"
         )
+        
+        st.markdown("<hr class='divider'>", unsafe_allow_html=True)
+        st.markdown(ui_components.get_header_html("Follow-Up", "Chat Interface", "", "step 03 — conversational query", ""), unsafe_allow_html=True)
+        st.markdown("<div class='spacer-20'></div>", unsafe_allow_html=True)
+        
+        # Render the chat dialog
+        for msg in st.session_state.get("chat_history", []):
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+                
+        # Handle new prompts
+        if prompt := st.chat_input("Ask a follow-up question about this dataset..."):
+            st.session_state["chat_history"].append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
+                
+            with st.spinner("Analyzing follow-up..."):
+                from langchain_core.messages import HumanMessage
+                app = build_data_quality_graph(checkpointer=st.session_state["checkpointer"])
+                config = {"configurable": {"thread_id": st.session_state["thread_id"]}}
+                
+                # Thanks to the conditional entry point, it bypasses the orchestrator node!
+                new_state = app.invoke({"messages": [HumanMessage(content=prompt)]}, config)
+                
+                ai_response = new_state["messages"][-1].content
+                st.session_state["chat_history"].append({"role": "assistant", "content": ai_response})
+                st.rerun()
 
 with tab2:
     st.header("Internal Functions Database")
@@ -204,3 +320,23 @@ with tab3:
             pass
     else:
         st.info("No Knowledge Graph available yet. Please upload a dataset and run the Quality Analysis on the New Analysis tab.")
+
+with tab4:
+    st.header("Domain Knowledge Base")
+    st.markdown("View all the Process, Physics, Equipment, and OEM knowledge constraints automatically injected into the Reasoning Agent prior to analysis.")
+    
+    try:
+        import sqlite3
+        with sqlite3.connect("knowledge.db", timeout=5.0) as conn:
+            current_thread = st.session_state.get("thread_id", "")
+            query = "SELECT category, topic, knowledge_text, updated_at FROM domain_knowledge WHERE thread_id = ? ORDER BY category, topic"
+            kb_df = pd.read_sql_query(query, conn, params=(current_thread,))
+            
+            st.metric("Total Knowledge Entries", len(kb_df))
+            st.dataframe(
+                kb_df,
+                use_container_width=True,
+                hide_index=True
+            )
+    except Exception as e:
+        st.error(f"Could not load knowledge database: {e}")

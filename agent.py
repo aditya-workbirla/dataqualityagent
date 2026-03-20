@@ -11,9 +11,10 @@ from tools import generate_and_test_custom_function, set_current_df, execute_exi
 # Define the LangGraph State type
 # This state dictionary is passed between every node in the graph.
 class AgentState(TypedDict):
-    df: pd.DataFrame
+    df_json: str
     user_context_prompt: str
     function_results_summary: Dict[str, Any]
+    retrieved_knowledge: str
     messages: Annotated[List[Any], operator.add]   # Use operator.add so messages append instead of overwrite
     issues: List[str]
     bad_indices_per_column: dict
@@ -68,22 +69,154 @@ def get_llm():
         http_client=custom_client
     )
 
+# ==============================================================================
+#                 NODE 1: THE FUNCTION ORCHESTRATOR
+# ==============================================================================
+def sanitize_for_msgpack(obj):
+    import numpy as np
+    if isinstance(obj, dict):
+        return {k: sanitize_for_msgpack(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [sanitize_for_msgpack(v) for v in obj]
+    elif isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        if np.isnan(obj) or np.isinf(obj):
+            return None
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return sanitize_for_msgpack(obj.tolist())
+    else:
+        return obj
+
 def collect_function_results_node(state: AgentState) -> AgentState:
     """
-    Node 1: Predefined Function Execution
     Runs all predefined statistical and quality checks on the raw dataset locally.
     """
-    df = state["df"]
-    summary = run_all_verified_functions(df)
+    import pandas as pd
+    import io
     
-    # Store df globally so the custom function generator can test it
+    # Reconstruct DF from string to bypass msgpack serialization errors in SQL state
+    df_json = state.get("df_json", "{}")
+    if getattr(df_json, "startswith", lambda x: False)("{"):
+         # In case they parse it directly as dict, handle list of dicts or normal JSON
+         pass
+    
+    try:
+        df = pd.read_json(io.StringIO(df_json))
+    except Exception:
+        df = pd.DataFrame() # Fallback
+        
+    summary = run_all_verified_functions(df)
+    summary = sanitize_for_msgpack(summary)
+    
+    # Store df globally so the custom function generator can test it tools.py
     set_current_df(df)
     
     return {"function_results_summary": summary}
 
+from langchain_core.runnables import RunnableConfig
+
+# ==============================================================================
+#                 NODE 1.5: THE KNOWLEDGE AGENT
+# ==============================================================================
+def knowledge_agent_node(state: AgentState, config: RunnableConfig) -> AgentState:
+    """
+    Builds the KB using online search if new conversation, then retrieves domain constraints 
+    from the 4-part Knowledge Base (Process, Physics, Equipment, OEM).
+    """
+    import sqlite3
+    import json
+    import datetime
+    from langchain_community.tools import DuckDuckGoSearchRun
+    from langchain_core.messages import SystemMessage
+    
+    db_path = "knowledge.db"
+    user_context = state.get("user_context_prompt", "")
+    messages = state.get("messages", [])
+    thread_id = config.get("configurable", {}).get("thread_id", "global")
+    
+    try:
+        raw_data = json.loads(state.get("df_json", "[]"))
+        columns = list(raw_data[0].keys()) if len(raw_data) > 0 else []
+        col_list = ", ".join(columns)
+    except Exception:
+        col_list = "Unknown Columns"
+    
+    # If messages is empty, it's the very first invocation in this thread
+    if not messages and user_context.strip():
+        try:
+            llm = get_llm()
+            search = DuckDuckGoSearchRun()
+            llm_with_tools = llm.bind_tools([search])
+            
+            prompt = f"You are an Expert Domain Knowledge Base Builder. The user is analyzing a dataset with this context: '{user_context}'. " \
+                     f"The dataset contains the following specific variables/columns: {col_list}. " \
+                     "1. Use the duckduckgo_search tool extensively to find deep process, physics, equipment, and OEM limits tailored EXACTLY to these specific variables for this exact industry. " \
+                     "2. Ask specific queries to the search engine. Once you have comprehensive facts, output exactly 4 JSON objects. " \
+                     "Each JSON object MUST have exactly these three keys: 'category', 'topic', and 'knowledge_text'. " \
+                     "The 4 Categories MUST be exactly: 'Process', 'Physics/Chemistry', 'Equipment', 'OEM'. " \
+                     "CRITICAL INSTRUCTION: The 'knowledge_text' for EACH of the 4 sections MUST be a highly detailed, comprehensive multi-paragraph document (at least 150 words per section). It must act as a definitive engineering referencing manual containing all relevant constraints, standard operating limits, formulas, and physics rules for that category. " \
+                     "DO NOT WRAP in markdown blocks. Output only the raw JSON array of 4 objects."
+            
+            sys_msg = SystemMessage(content=prompt)
+            # Give it more turns to search aggressively
+            agent_msgs = [sys_msg]
+            for _ in range(7): # max 7 turns
+                response = llm_with_tools.invoke(agent_msgs)
+                agent_msgs.append(response)
+                
+                if not getattr(response, "tool_calls", None):
+                    break
+                    
+                for tc in response.tool_calls:
+                    if tc["name"] in ["duckduckgo_search", "duckduckgo_results_json"]: 
+                        res = search.invoke(tc["args"])
+                        agent_msgs.append({"role": "tool", "name": tc["name"], "content": str(res), "tool_call_id": tc["id"]})
+                        
+            # Parse final response
+            import re
+            final_text = agent_msgs[-1].content
+            match = re.search(r'\[.*\]', final_text, re.DOTALL)
+            if match:
+                final_text = match.group(0)
+            new_rules = json.loads(final_text)
+            
+            # Save to knowledge.db
+            with sqlite3.connect(db_path, timeout=5.0) as conn:
+                cursor = conn.cursor()
+                now = datetime.datetime.now().isoformat()
+                for rule in new_rules:
+                    cursor.execute('''
+                    INSERT INTO domain_knowledge (thread_id, category, topic, knowledge_text, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ''', (thread_id, rule.get('category'), rule.get('topic'), rule.get('knowledge_text'), now, now))
+                conn.commit()
+        except Exception as e:
+            print(f"Failed to auto-build knowledge base: {e}")
+
+    retrieved_text = ""
+    try:
+        with sqlite3.connect(db_path, timeout=5.0) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT category, topic, knowledge_text FROM domain_knowledge WHERE thread_id = ?", (thread_id,))
+            results = cursor.fetchall()
+            if results:
+                for r in results:
+                    retrieved_text += f"- [{r[0]}] {r[1]}: {r[2]}\n"
+            else:
+                retrieved_text = "No domain knowledge found in database."
+    except Exception as e:
+        retrieved_text = f"Could not load knowledge base: {e}"
+        
+    return {"retrieved_knowledge": retrieved_text}
+
+
+# ==============================================================================
+#                 NODE 2: THE REASONING AGENT
+# ==============================================================================
 def quality_analyst_node(state: AgentState) -> AgentState:
     """
-    Node 2: LLM Contextual Analysis
     The core AI node. It reviews the JSON summary of predefined checks, applying 
     the user's specific context/domain prompt to identify anomalies.
     """
@@ -107,13 +240,28 @@ def quality_analyst_node(state: AgentState) -> AgentState:
                 advanced_funcs_desc = "\n".join([f"        - {f[0]}: {f[1]}" for f in funcs])
     except Exception as e:
         advanced_funcs_desc = f"        - (Could not load from DB: {e})"
+        
+    knowledge = state.get("retrieved_knowledge", "No domain knowledge retrieved.")
+    
+    import json
+    try:
+        raw_data = json.loads(state.get("df_json", "[]"))
+        num_rows = len(raw_data)
+        columns = list(raw_data[0].keys()) if num_rows > 0 else []
+        dataset_metadata = f"The dataset has {num_rows} rows and {len(columns)} columns.\nAvailable Columns: {', '.join(columns)}"
+    except Exception:
+        dataset_metadata = "Dataset dimensions could not be parsed."
     
     system_prompt = f"""You are an expert Data Quality Analyst. Your job is to analyze the output of predefined data quality checks.
+    
+    DATASET OVERVIEW:
+    {dataset_metadata}
+    
     The user has provided the following context about the data:
     "{user_context}"
     
     You need to:
-    1. Review the JSON output of the predefined functions (e.g. missing values, repeating values, outliers, min/max).
+    1. Review the JSON output of ALL the predefined functions (e.g. missing values, repeating values, outliers, min/max).
     2. You also need to check if the values are realistic based on the user's context. Don't just highlight missing, repeated, negative values because that would be very surface level. Along with highlighting those, highlight insights about the data quality that are not easy to catch.
     3. Reason about the physics and logic of the variables *based STRICTLY on the user's context*.
         For example: If the user context says it's a Pulp and Fiber plant, use your knowledge of that domain to understand if certain values (like negative pressures or temperatures, or specific pH ranges) are realistic. TEMPERATURE CAN BE NEGATIVE, PRESSURE CANNOT BE NEGATIVE.
@@ -126,6 +274,8 @@ def quality_analyst_node(state: AgentState) -> AgentState:
         AVAILABLE ADVANCED FUNCTIONS:
 {advanced_funcs_desc}
         If the function requires a timestamp column, you must provide it in the params dictionary like `{{"timestamp_col": "NameOfColumn"}}`.
+    6. Ensure your reasoning STRICTLY ADHERES to the following domain limits retrieved from our 4-part physical Knowledge Base (Process, Physics/Chemistry, Equipment, OEM):
+{knowledge}
     
     If you use any tool, log the results as a specific data quality issue.
     
@@ -200,7 +350,12 @@ def should_continue(state: AgentState) -> str:
         
     if getattr(last_message, "tool_calls", None):
         return "continue"
-    return "end"
+        
+    # If a report already exists in state, this is a follow-up chat. Bypass report generation layer.
+    if state.get("report"):
+        return "chat_end"
+        
+    return "generate_report"
 
 def generate_report_node(state: AgentState) -> AgentState:
     """
@@ -214,19 +369,19 @@ def generate_report_node(state: AgentState) -> AgentState:
     # Grab the final analysis from the LLM
     final_analysis = messages[-1].content
     
-    # Build text for missing and repeating percentages
-    missing_repeating_text = ""
-    for col, col_data in summary.items():
-        if col == "dataset_checks":
-            continue
-        checks = col_data.get("checks", {})
-        missing_pct = checks.get("check_missing_values", {}).get("missing_percentage", "N/A")
-        repeating_pct = checks.get("check_repeating_values", {}).get("consecutive_repeating_percentage", "N/A")
-        missing_repeating_text += f"       - **{col}**: {missing_pct}% missing, {repeating_pct}% repeating\n"
-        
-    # Extract advanced dataset checks summary
-    dataset_summary = ""
+    # Build text for missing values and high-level column stats
+    missing_repeating_text = "       (Aggregated from automated Group 1 checks)\n"
+    
     dataset_checks = summary.get("dataset_checks", {})
+    null_results = dataset_checks.get("check_null_values", {}).get("column_results", {})
+    
+    # We'll use the columns found in null_results to list metrics for all columns
+    for col, stats in null_results.items():
+        null_pct = stats.get("null_pct", "N/A")
+        missing_repeating_text += f"       - **{col}**: {null_pct}% null/missing\n"
+        
+    # Extract advanced dataset checks summary (Group 1 overview)
+    dataset_summary = ""
     for check_name, check_result in dataset_checks.items():
         ds_msg = check_result.get("summary", "")
         if ds_msg:
@@ -238,7 +393,7 @@ def generate_report_node(state: AgentState) -> AgentState:
     The report should have sections for:
     1. Executive Summary
     2. Missing and Repeating Values
-       IMPORTANT: You MUST explicitly include the following column-wise percentages for ALL columns in this section:
+       IMPORTANT: You MUST explicitly include the following column-wise percentages for ALL columns in the dataset:
 {missing_repeating_text}
     3. Advanced Dataset Quality
        Include these high-level dataset metrics:
@@ -256,7 +411,17 @@ def generate_report_node(state: AgentState) -> AgentState:
     
     return {"report": response.content}
 
-def build_data_quality_graph() -> StateGraph:
+def route_to_start(state: AgentState) -> str:
+    """
+    Conditional entry point: bypass the orchestrator if this is a follow-up chat.
+    If function_results_summary is already populated, do not run it again.
+    """
+    summary = state.get("function_results_summary", {})
+    if summary:
+        return "knowledge_agent"
+    return "collect_function_results"
+
+def build_data_quality_graph(checkpointer=None) -> StateGraph:
     """
     Assembles and compiles the LangGraph workflow.
     """
@@ -265,13 +430,21 @@ def build_data_quality_graph() -> StateGraph:
     
     # Add Nodes
     workflow.add_node("collect_function_results", collect_function_results_node)
+    workflow.add_node("knowledge_agent", knowledge_agent_node)
     workflow.add_node("quality_analyst", quality_analyst_node)
     workflow.add_node("tool_execution", tool_execution_node)
     workflow.add_node("generate_report", generate_report_node)
     
-    # Define execution order
-    workflow.set_entry_point("collect_function_results")
-    workflow.add_edge("collect_function_results", "quality_analyst")
+    # Define execution order using conditional entry point
+    workflow.set_conditional_entry_point(
+        route_to_start,
+        {
+            "collect_function_results": "collect_function_results",
+            "knowledge_agent": "knowledge_agent"
+        }
+    )
+    workflow.add_edge("collect_function_results", "knowledge_agent")
+    workflow.add_edge("knowledge_agent", "quality_analyst")
     
     # Conditional edge: after Analyst, either run a tool or generate the final report
     workflow.add_conditional_edges(
@@ -279,11 +452,12 @@ def build_data_quality_graph() -> StateGraph:
         should_continue,
         {
             "continue": "tool_execution",
-            "end": "generate_report"
+            "generate_report": "generate_report",
+            "chat_end": END
         }
     )
     # After a tool runs, ALWAYS return to the Analyst so it can read the result
     workflow.add_edge("tool_execution", "quality_analyst")
     workflow.add_edge("generate_report", END)
     
-    return workflow.compile()
+    return workflow.compile(checkpointer=checkpointer)

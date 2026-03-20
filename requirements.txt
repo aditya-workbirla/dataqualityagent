@@ -8,3 +8,7 @@ python-dotenv
 streamlit
 networkx
 pyvis
+langgraph-checkpoint-sqlite
+duckduckgo-search
+langchain-community
+ddgs

@@ -7,7 +7,7 @@ import os
 def build_knowledge_graph(df: pd.DataFrame, json_path="knowledge_graph.json"):
     """
     Analyzes the dataframe, generates a Knowledge Graph JSON containing 
-    min, max, and top 5 correlated variables for each column.
+    min, max, and top 3 correlated variables for each column.
     Then builds an interactive PyVis network HTML string.
     """
     numeric_df = df.select_dtypes(include=['number'])
@@ -24,17 +24,17 @@ def build_knowledge_graph(df: pd.DataFrame, json_path="knowledge_graph.json"):
         col_min = float(numeric_df[col].min())
         col_max = float(numeric_df[col].max())
         
-        # Get top 5 correlated
+        # Get top 3 correlated
         if col in corr_matrix.columns:
             corrs = corr_matrix[col].drop(index=[col]).dropna()
-            top_5 = corrs.sort_values(ascending=False).head(5).index.tolist()
+            top_3 = corrs.sort_values(ascending=False).head(3).index.tolist()
         else:
-            top_5 = []
+            top_3 = []
             
         kg_dict[col] = {
             "min": col_min,
             "max": col_max,
-            "top_5_correlated": top_5
+            "top_3_correlated": top_3
         }
         
     # Write the JSON as requested
@@ -60,7 +60,7 @@ def build_knowledge_graph(df: pd.DataFrame, json_path="knowledge_graph.json"):
         
     # Add Edges
     for col, info in kg_dict.items():
-        for target in info["top_5_correlated"]:
+        for target in info["top_3_correlated"]:
             # Make sure target node actually exists before adding edge
             if target in kg_dict:
                 net.add_edge(col, target, color="#4f6f8f", value=1, physics=True)
