@@ -1,0 +1,11 @@
+ID,Start Date,End Date,Flow Rate,Dosing Rate,Status,Age,Location
+1,2023-01-01,2023-01-05,100,5.5,Active,34,SiteA
+2,2023-01-02,2022-12-01,150,-2.0,Active,,SiteA
+3,2023-01-03,2023-01-06,-50,4.0,Inactive,200,SiteA
+4,2023-01-04,2023-01-08,120,6.0,Active,-1,SiteA
+5,2023-01-05,2023-01-10,95,3.5,Pending,25,SiteA
+6,2023-01-06,2023-01-11,110,5.0,Active,45,SiteA
+7,2023-01-07,2023-01-12,80,4.2,Active,28,SiteA
+8,2023-01-08,2023-01-15,130,7.1,Inactive,39,SiteA
+9,2023-01-09,,105,5.8,Active,41,SiteA
+10,2023-01-10,2023-01-18,140,6.5,Active,50,SiteA

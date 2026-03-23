@@ -1,16 +1,16 @@
 import streamlit as st
-import pandas as pd
-import io
 import os
-from dotenv import load_dotenv
-
-from agent import build_data_quality_graph, AgentState
-import ui_components
-import kg_builder
+import pandas as pd
+import os
+from dotenv import load_dotenv # Ensure the local modules can be found
+from agents.agent import build_data_quality_graph, AgentState
+from ui import ui_components
+from agents import kg_builder
 import streamlit.components.v1 as components
 from langgraph.checkpoint.sqlite import SqliteSaver
 import sqlite3
 import uuid
+import json
 
 # Load environment variables
 load_dotenv(override=True)
@@ -21,8 +21,12 @@ st.set_page_config(
     layout="wide"
 )
 
-# Inject the custom CSS and glowing variables
-st.markdown(ui_components.load_css("style.css"), unsafe_allow_html=True)
+# Load custom CSS
+try:
+    with open("ui/style.css", "r") as f:
+        st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
+except FileNotFoundError:
+    st.warning("Could not load ui/style.css. Ensure the file exists.")
 
 # Top Navigation Bar mimicking HTML
 st.markdown(ui_components.get_nav_html(), unsafe_allow_html=True)
@@ -55,15 +59,13 @@ if "analysis_done" not in st.session_state:
     st.session_state["analysis_done"] = False
 if "agent_state" not in st.session_state:
     st.session_state["agent_state"] = None
-if "kg_html" not in st.session_state:
-    st.session_state["kg_html"] = None
+if "chat_history" not in st.session_state:
+    st.session_state["chat_history"] = []
 if "checkpointer" not in st.session_state:
-    conn = sqlite3.connect("checkpoints.db", check_same_thread=False)
+    conn = sqlite3.connect("database/app.db", check_same_thread=False)
     saver = SqliteSaver(conn)
     saver.setup()  # Ensures the checkpoints tables are created
     st.session_state["checkpointer"] = saver
-if "chat_history" not in st.session_state:
-    st.session_state["chat_history"] = []
 if "thread_id" not in st.session_state:
     st.session_state["thread_id"] = str(uuid.uuid4())
 
@@ -75,7 +77,7 @@ with st.sidebar:
     st.header("🗄️ Session History")
     # Fetch threads from sqlite checkpointer
     try:
-        with sqlite3.connect("checkpoints.db", timeout=5.0) as cp_conn:
+        with sqlite3.connect("database/app.db", timeout=5.0) as cp_conn:
             cp_cursor = cp_conn.cursor()
             cp_cursor.execute("SELECT DISTINCT thread_id FROM checkpoints")
             threads = [row[0] for row in cp_cursor.fetchall() if row[0] != "main_thread"]
@@ -135,7 +137,7 @@ with st.sidebar:
                 # Rebuild Knowledge Graph since it's not natively in state
                 if st.session_state["annotated_df"] is not None:
                     try:
-                        st.session_state["kg_html"] = kg_builder.build_knowledge_graph(st.session_state["annotated_df"])
+                        st.session_state["kg_html"] = kg_builder.build_knowledge_graph(st.session_state["annotated_df"], "data/knowledge_graph.json")
                     except Exception:
                         pass
                 
@@ -190,8 +192,9 @@ with tab1:
                 st.session_state["thread_id"] = str(uuid.uuid4())
                 st.session_state["chat_history"] = []
                 
-                # Initialize Graph explicitly wrapping it in the memory saver checkpointer
-                app = build_data_quality_graph(checkpointer=st.session_state["checkpointer"])
+                # Checkpointer state config (Uses SQLite Checkpoints)
+                app_graph = build_data_quality_graph(checkpointer=st.session_state["checkpointer"])
+                
                 config = {"configurable": {"thread_id": st.session_state["thread_id"]}}
                 
                 initial_state = {
@@ -201,14 +204,14 @@ with tab1:
                 }
                 
                 # Run the Agent with thread config
-                final_state = app.invoke(initial_state, config)
+                final_state = app_graph.invoke(initial_state, config)
                 st.session_state["report"] = final_state.get("report", "No report generated.")
                 st.session_state["annotated_df"] = df
                 st.session_state["agent_state"] = final_state
                 
                 # Build Knowledge Graph JSON and HTML
                 try:
-                    st.session_state["kg_html"] = kg_builder.build_knowledge_graph(df)
+                    st.session_state["kg_html"] = kg_builder.build_knowledge_graph(df, "data/knowledge_graph.json")
                 except Exception as kg_err:
                     st.error(f"Error building knowledge graph: {kg_err}")
                     
@@ -267,12 +270,13 @@ with tab1:
 
 with tab2:
     st.header("Internal Functions Database")
-    st.markdown("View all pre-defined and agent-generated data quality functions securely stored in `functions.db`.")
+    st.markdown("View all pre-defined and agent-generated data quality functions securely stored in `database/app.db`.")
     
     try:
         import sqlite3
-        with sqlite3.connect("functions.db", timeout=5.0) as conn:
-            db_df = pd.read_sql_query("SELECT * FROM data_quality_functions ORDER BY approved_by_team DESC, created_at DESC", conn)
+        with sqlite3.connect("database/app.db", timeout=5.0) as conn:
+            query = "SELECT function_name, function_description, function_group, approved_by_team, updated_at FROM data_quality_functions"
+            db_df = pd.read_sql_query(query, conn)
             
             # Convert boolean column to string for better display
             if 'approved_by_team' in db_df.columns:
@@ -308,7 +312,7 @@ with tab3:
         components.html(st.session_state["kg_html"], height=650)
         
         try:
-            with open("knowledge_graph.json", "rb") as f:
+            with open("data/knowledge_graph.json", "rb") as f:
                 kg_json = f.read()
             st.download_button(
                 label="⬇ Download Knowledge Graph (JSON)", 
@@ -327,10 +331,15 @@ with tab4:
     
     try:
         import sqlite3
-        with sqlite3.connect("knowledge.db", timeout=5.0) as conn:
+        with sqlite3.connect("database/app.db", timeout=5.0) as conn:
             current_thread = st.session_state.get("thread_id", "")
             query = "SELECT category, topic, knowledge_text, updated_at FROM domain_knowledge WHERE thread_id = ? ORDER BY category, topic"
             kb_df = pd.read_sql_query(query, conn, params=(current_thread,))
+            
+            if len(kb_df) == 0:
+                query_all = "SELECT category, topic, knowledge_text, updated_at, thread_id FROM domain_knowledge ORDER BY category, topic"
+                kb_df = pd.read_sql_query(query_all, conn)
+                st.info("Displaying the **Global Knowledge Base** aggregator. Start a new analysis to drill down into a thread-specific constraints block.")
             
             st.metric("Total Knowledge Entries", len(kb_df))
             st.dataframe(
