@@ -57,8 +57,8 @@ def get_llm():
     import httpx
     use_azure = os.getenv("USE_AZURE_OPENAI", "false").lower() == "true"
     
-    # Bypass corporate SSL MITM inspection and broken Windows Registry proxies
-    custom_client = httpx.Client(verify=False, trust_env=False)
+    # Bypass corporate SSL MITM inspection and enforce 10-second drops
+    custom_client = httpx.Client(verify=False, trust_env=False, timeout=10.0)
     
     if use_azure:
         return AzureChatOpenAI(
@@ -67,11 +67,15 @@ def get_llm():
             api_key=os.getenv("AZURE_OPENAI_API_KEY"),
             azure_deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"),
             temperature=0,
+            max_retries=1,
+            timeout=10.0,
             http_client=custom_client
         )
     return ChatOpenAI(
         model="gpt-4o-mini", 
         temperature=0,
+        max_retries=1,
+        timeout=10.0,
         http_client=custom_client
     )
 
@@ -187,14 +191,219 @@ def knowledge_agent_node(state: AgentState, config: RunnableConfig) -> AgentStat
     search = DuckDuckGoSearchRun()
     llm_with_tools = llm.bind_tools([search])
     
-    prompt = f"You are an Expert Domain Knowledge Base Builder. The user is analyzing a dataset with this context: '{user_context}'. " \
-             f"The dataset contains the following specific variables/columns: {col_list}. " \
-             "1. Use the duckduckgo_search tool extensively to find deep process, physics, equipment, and OEM limits tailored EXACTLY to these variables. " \
-             "2. Output exactly 4 JSON objects in a JSON array. " \
-             "Each JSON object MUST have exactly these three keys: 'category', 'topic', and 'knowledge_text'. " \
-             "The 4 Categories MUST be exactly: 'Process', 'Physics/Chemistry', 'Equipment', 'OEM'. " \
-             "CRITICAL INSTRUCTION: The 'knowledge_text' for EACH of the 4 sections MUST be a highly detailed, comprehensive multi-paragraph document (at least 900 words per section). It must act as a definitive engineering referencing manual containing all relevant constraints, standard operating limits, formulas, and physics rules for that category. " \
-             "DO NOT WRAP in markdown blocks. Output only the raw JSON array of 4 objects."
+    prompt = f"""
+You are an Expert Domain Knowledge Base Builder for industrial/process data analysis.
+
+You are building a permanent technical knowledge base for a single chat session. This knowledge base will be used as the fixed engineering reference for all downstream follow-up questions in the chat. Therefore, the output must be specific, technically rigorous, practically useful, and tightly aligned to the dataset variables.
+
+USER CONTEXT:
+{user_context}
+
+DATASET VARIABLES / COLUMNS:
+{col_list}
+
+PRIMARY OBJECTIVE:
+Generate a high-quality domain knowledge base tailored specifically to the user context and the listed dataset variables/columns.
+
+SEARCH INSTRUCTION:
+Use the duckduckgo_search tool extensively and intelligently to gather relevant information. Search deeply for:
+- process understanding related to the variables
+- physics and chemistry relationships governing the variables
+- equipment behavior, constraints, and operational relevance
+- OEM/vendor/manual/spec-limit style guidance where available
+
+Do not rely on generic industrial boilerplate. Prioritize information that can help interpret, troubleshoot, validate, and reason about the actual variables in this dataset.
+
+--------------------------------------------------
+CORE REQUIREMENTS
+--------------------------------------------------
+
+You must output exactly 4 JSON objects inside a single JSON array.
+
+Each JSON object must contain exactly these 3 keys:
+- "category"
+- "topic"
+- "knowledge_text"
+
+The 4 categories must be exactly:
+1. "Process"
+2. "Physics/Chemistry"
+3. "Equipment"
+4. "OEM"
+
+Do not output markdown.
+Do not output commentary.
+Do not output any keys other than the 3 required keys.
+Output only the raw JSON array.
+
+--------------------------------------------------
+GLOBAL QUALITY STANDARD
+--------------------------------------------------
+
+Each section must be written as if it will be used by an engineer or analyst to interpret process data from this exact dataset.
+
+This means each section must:
+- explicitly reference the kinds of variables present in the dataset
+- explain how these variables are used in interpretation
+- include operating logic, constraints, cause-effect relationships, and analytical relevance
+- avoid vague statements such as "temperature is important" unless followed by specific engineering interpretation
+- avoid filler, repetition, and generic textbook explanation
+- include practical reasoning useful for anomaly detection, diagnostics, root cause analysis, and follow-up Q&A
+
+Each "knowledge_text" must be:
+- highly detailed
+- multi-paragraph
+- comprehensive
+- at least 900 words
+- tailored to the given context and variables
+
+--------------------------------------------------
+VARIABLE GROUNDING RULES
+--------------------------------------------------
+
+Before writing, infer likely variable types from the dataset columns, such as:
+- temperature
+- pressure
+- flow
+- level
+- composition
+- pH
+- speed
+- current
+- vibration
+- valve position
+- control signals
+- utility variables
+- equipment tags
+- alarms/status indicators
+
+You must ground the knowledge base in these variables.
+
+For every section:
+- mention representative variables or variable groups from the dataset
+- explain what those variables likely indicate in operation
+- explain how changes in one variable may affect others
+- explain how analysts should interpret these variables together, not in isolation
+
+If exact equipment/process identity is uncertain, make careful engineering inferences from naming patterns, but do not invent highly specific plant facts unless supported by the variable names and search results.
+
+--------------------------------------------------
+SECTION-SPECIFIC INSTRUCTIONS
+--------------------------------------------------
+
+SECTION 1: PROCESS
+Category must be "Process"
+
+Topic should summarize the process understanding for the dataset.
+
+The Process section must:
+- explain the likely process flow and operational sequence implied by the variables
+- describe how material, energy, or utility streams likely move through the system
+- explain upstream/downstream relationships between variable groups
+- identify likely control points, bottlenecks, recirculation loops, heat exchange stages, separation stages, reaction stages, or utility interactions if relevant
+- explain what “normal operation” would mean in terms of variable patterns
+- explain what abnormal patterns may indicate
+- connect process behavior to the user context, not just generic plant theory
+- help a downstream analyst understand the system holistically from a process perspective
+
+This section should read like a process-engineering operating interpretation manual tailored to the dataset.
+
+SECTION 2: PHYSICS/CHEMISTRY
+Category must be "Physics/Chemistry"
+
+Topic should summarize the governing physical and chemical principles for the dataset.
+
+The Physics/Chemistry section must:
+- explain the physical laws, thermodynamics, fluid mechanics, heat transfer, mass transfer, reaction behavior, equilibrium behavior, or chemical interactions relevant to the variables
+- include equations, proportionalities, or directional relationships wherever useful
+- explain how variables such as temperature, pressure, flow, concentration, and level interact physically
+- describe expected first-principles behavior, including nonlinearities, delays, coupling, and trade-offs
+- explain what variable combinations may violate physical expectations and therefore signal bad data, fouling, sensor issues, leaks, instability, or process upset
+- include engineering reasoning that can support validation, feature engineering, and anomaly detection
+- avoid becoming a generic chemistry textbook; tie every major concept back to likely variable interpretation in this dataset
+
+This section should read like a first-principles diagnostic reference for the actual data.
+
+SECTION 3: EQUIPMENT
+Category must be "Equipment"
+
+Topic should summarize the equipment-level interpretation for the dataset.
+
+The Equipment section must:
+- identify likely equipment classes implied by the variables, such as pumps, compressors, blowers, fans, heat exchangers, columns, tanks, reactors, scrubbers, filters, valves, condensers, evaporators, separators, conveyors, motors, and instrumentation loops
+- explain what each equipment class does and how its health/performance appears in process data
+- describe expected input-output variable relationships for each equipment type
+- explain common failure modes and how they appear in variables
+- discuss control behavior, operating constraints, and performance degradation patterns
+- explain what analysts should look for in pressure, flow, temperature, level, current, differential pressure, vibration, or valve movement data
+- distinguish process-side issues from equipment-side issues where possible
+- make the section useful for troubleshooting and engineering interpretation of actual tags/variables
+
+This section should read like a practical equipment troubleshooting and interpretation guide for the dataset.
+
+SECTION 4: OEM
+Category must be "OEM"
+
+Topic should summarize OEM/manual/specification style constraints relevant to the dataset.
+
+The OEM section must:
+- focus on specification-style guidance, design envelopes, operating windows, alarm/trip philosophies, maintenance recommendations, and vendor/manual style constraints
+- include realistic types of OEM considerations such as allowable temperature limits, pressure ranges, flow operating windows, NPSH considerations, fouling margins, vibration thresholds, motor loading considerations, control valve sizing implications, exchanger approach temperatures, separator residence times, pump/compressor operating regions, and instrument accuracy/response limitations where relevant
+- clearly distinguish between hard OEM limits, common industry guidance, and inferred good engineering practice
+- state when exact OEM values are equipment-specific and should be validated against actual manuals
+- provide the analyst with actionable “do not over-interpret beyond this limit” style cautionary guidance
+- help downstream users understand what kinds of boundaries, thresholds, and reliability limits matter when analyzing the dataset
+
+This section should read like a vendor/OEM/specification-oriented engineering reference, even when exact vendor data is not available.
+
+--------------------------------------------------
+ANTI-GENERIC RULES
+--------------------------------------------------
+
+Do NOT do any of the following:
+- do not write shallow summaries
+- do not repeat the same content across sections
+- do not use generic filler to reach word count
+- do not provide generic safety disclaimers unless directly relevant
+- do not describe broad industrial concepts without linking them to likely variables in this dataset
+- do not invent precise OEM numbers unless they are strongly supported by search results or standard engineering practice
+- do not produce near-duplicate paragraphs across Process / Physics / Equipment / OEM
+
+Each section must feel distinct in purpose:
+- Process = system flow and operating logic
+- Physics/Chemistry = first-principles governing behavior
+- Equipment = asset-level interpretation and failure behavior
+- OEM = specification limits, envelopes, vendor-style constraints, caution boundaries
+
+--------------------------------------------------
+OUTPUT FORMAT EXAMPLE STRUCTURE
+--------------------------------------------------
+
+[
+  {{
+    "category": "Process",
+    "topic": "....",
+    "knowledge_text": "...."
+  }},
+  {{
+    "category": "Physics/Chemistry",
+    "topic": "....",
+    "knowledge_text": "...."
+  }},
+  {{
+    "category": "Equipment",
+    "topic": "....",
+    "knowledge_text": "...."
+  }},
+  {{
+    "category": "OEM",
+    "topic": "....",
+    "knowledge_text": "...."
+  }}
+]
+
+Return only the raw JSON array.
+"""
              
     if critique:
         prompt += f"""
@@ -221,7 +430,16 @@ CRITICAL: Do NOT repeat the exact same generic output. Increase specificity, inc
             
         for tc in response.tool_calls:
             if tc["name"] in ["duckduckgo_search", "duckduckgo_results_json"]: 
-                res = search.invoke(tc["args"])
+                import concurrent.futures
+                try:
+                    with concurrent.futures.ThreadPoolExecutor() as executor:
+                        future = executor.submit(search.invoke, tc["args"])
+                        res = future.result(timeout=10.0)
+                except concurrent.futures.TimeoutError:
+                    res = "Error: DuckDuckGo search timed out! SSH firewall is blocking outbound internet access. DO NOT search again. Generate engineering constraints manually using only your pre-trained domain knowledge."
+                except Exception as e:
+                    res = f"Search failed: {e}"
+                
                 agent_msgs.append({"role": "tool", "name": tc["name"], "content": str(res), "tool_call_id": tc["id"]})
                 
     # Parse final response
