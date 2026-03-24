@@ -57,8 +57,9 @@ def get_llm():
     import httpx
     use_azure = os.getenv("USE_AZURE_OPENAI", "false").lower() == "true"
     
-    # Bypass corporate SSL MITM inspection and enforce 10-second drops
-    custom_client = httpx.Client(verify=False, trust_env=False, timeout=10.0)
+    # Force 10s connection drop for dead firewalls, but permit 120s execution reads for >4000 token LLM generations
+    timeout = httpx.Timeout(120.0, connect=10.0)
+    custom_client = httpx.Client(verify=False, trust_env=False, timeout=timeout)
     
     if use_azure:
         return AzureChatOpenAI(
@@ -68,14 +69,14 @@ def get_llm():
             azure_deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"),
             temperature=0,
             max_retries=1,
-            timeout=10.0,
+            request_timeout=120.0,
             http_client=custom_client
         )
     return ChatOpenAI(
         model="gpt-4o-mini", 
         temperature=0,
         max_retries=1,
-        timeout=10.0,
+        request_timeout=120.0,
         http_client=custom_client
     )
 
