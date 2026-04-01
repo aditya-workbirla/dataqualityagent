@@ -52,44 +52,92 @@ if not api_key_set:
     st.stop()
 
 # ── LLM endpoint connectivity pre-check ──────────────────────────────────────
-def _check_llm_endpoint() -> tuple[bool, str]:
+def _check_llm_endpoint() -> tuple[bool, str, float]:
     """
-    Quick TCP-level check (≤5 s) so we surface a clear error before the
-    agent pipeline runs and hangs for minutes.
-    Private IP endpoints (10.x / 172.x / 192.168.x) are tested directly,
-    bypassing the Zscaler corporate proxy which cannot reach private subnets.
+    Quick TCP-level check (≤5 s) + a live ping to the completions endpoint.
+    Returns (ok, message, latency_ms).
     """
-    import socket
+    import socket, time, httpx
     if os.getenv("USE_AZURE_OPENAI", "false").lower() == "true":
         raw = os.getenv("AZURE_OPENAI_ENDPOINT", "")
     else:
         raw = "https://api.openai.com"
 
+    from urllib.parse import urlparse
+    parsed = urlparse(raw)
+    host = parsed.hostname or raw
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+    # Step 1: TCP reachability
+    t0 = time.time()
     try:
-        from urllib.parse import urlparse
-        parsed = urlparse(raw)
-        host = parsed.hostname or raw
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
         sock = socket.create_connection((host, port), timeout=5)
         sock.close()
-        return True, ""
+        tcp_ms = (time.time() - t0) * 1000
     except Exception as e:
-        return False, f"`{raw}` — {type(e).__name__}: {e}"
+        return False, f"TCP connect to `{raw}` failed — {type(e).__name__}: {e}", 0.0
+
+    # Step 2: live API ping (1 token)  
+    _is_private = any(host.startswith(p) for p in ("10.", "172.", "192.168."))
+    host_hdr = os.getenv("AZURE_OPENAI_HOST_HEADER", "")
+    api_key   = os.getenv("AZURE_OPENAI_API_KEY", "") or os.getenv("OPENAI_API_KEY", "")
+    deploy    = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4o")
+    api_ver   = os.getenv("AZURE_OPENAI_API_VERSION", "2023-05-15")
+
+    if os.getenv("USE_AZURE_OPENAI", "false").lower() == "true":
+        url = f"{raw.rstrip('/')}/openai/deployments/{deploy}/chat/completions?api-version={api_ver}"
+        headers = {"api-key": api_key, "Content-Type": "application/json"}
+        if _is_private and host_hdr:
+            headers["Host"] = host_hdr
+    else:
+        url = "https://api.openai.com/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+    t1 = time.time()
+    try:
+        r = httpx.post(
+            url,
+            json={"messages": [{"role": "user", "content": "ping"}], "max_completion_tokens": 1},
+            headers=headers,
+            timeout=httpx.Timeout(12.0, connect=5.0),
+            verify=False,
+            trust_env=not _is_private,
+        )
+        api_ms = (time.time() - t1) * 1000
+        if r.status_code == 200:
+            return True, f"Connected · `{raw}` · TCP {tcp_ms:.0f} ms · API {api_ms:.0f} ms", api_ms
+        else:
+            err = r.json().get("error", {}).get("message", r.text[:120])
+            return False, f"HTTP {r.status_code} from `{raw}` — {err}", api_ms
+    except Exception as e:
+        return False, f"TCP OK but API call failed — {type(e).__name__}: {e}", 0.0
 
 if "llm_endpoint_ok" not in st.session_state:
-    ok, reason = _check_llm_endpoint()
-    st.session_state["llm_endpoint_ok"] = ok
-    st.session_state["llm_endpoint_reason"] = reason
+    with st.sidebar:
+        with st.status("🔌 Checking LLM endpoint…", expanded=False) as _ep_status:
+            ok, reason, latency = _check_llm_endpoint()
+            st.session_state["llm_endpoint_ok"] = ok
+            st.session_state["llm_endpoint_reason"] = reason
+            if ok:
+                _ep_status.update(label=f"✅ LLM endpoint reachable", state="complete", expanded=False)
+            else:
+                _ep_status.update(label="❌ LLM endpoint unreachable", state="error", expanded=True)
+                st.error(reason)
 
-if not st.session_state["llm_endpoint_ok"]:
-    st.error(
-        f"⚠️ **LLM endpoint is unreachable.** The analysis will fail until this is resolved.\n\n"
-        f"**Endpoint:** {st.session_state['llm_endpoint_reason']}\n\n"
-        f"Possible fixes:\n"
-        f"- Confirm `AZURE_OPENAI_ENDPOINT` / `OPENAI_API_KEY` in your `.env` file are correct.\n"
-        f"- Check that this server has network access to the endpoint (firewall / VPN / proxy).\n"
-        f"- If using a private Azure endpoint (e.g. `http://10.x.x.x`), ensure the network route is up."
-    )
+# Sidebar persistent endpoint badge
+with st.sidebar:
+    if st.session_state.get("llm_endpoint_ok"):
+        st.success(f"🟢 **LLM Online** — {st.session_state['llm_endpoint_reason']}", icon=None)
+    else:
+        st.error(
+            f"🔴 **LLM Offline**\n\n{st.session_state.get('llm_endpoint_reason','')}\n\n"
+            f"**Possible fixes:**\n"
+            f"- Check `AZURE_OPENAI_ENDPOINT` and `AZURE_OPENAI_API_KEY` in `.env`\n"
+            f"- Verify `AZURE_OPENAI_DEPLOYMENT_NAME` matches the deployed model name in Azure\n"
+            f"- Check `AZURE_OPENAI_API_VERSION` is supported by your deployment\n"
+            f"- If endpoint is a private IP (`10.x.x.x`), ensure subnet `10.10.11.x` is whitelisted in Azure Networking"
+        )
+    st.divider()
 
 # Initialize session state variables if they don't exist
 if "report" not in st.session_state:
@@ -226,41 +274,97 @@ with tab1:
     
     run_button = st.button("▶ Run Quality Analysis", type="primary", use_container_width=False)
 
+    # ── Node → human-readable label map ──────────────────────────────────────
+    _NODE_LABELS = {
+        "collect_function_results": ("⚙️", "Running pre-defined quality checks on dataset…"),
+        "check_existing_kb":        ("🗄️", "Checking for existing domain knowledge base…"),
+        "knowledge_agent":          ("🔍", "Building domain knowledge base (Process / Physics / Equipment / OEM)…"),
+        "critique_agent":           ("🧐", "Critiquing & scoring the knowledge base…"),
+        "finalize_kb":              ("💾", "Finalising & saving the knowledge base…"),
+        "quality_analyst":          ("🧠", "Reasoning agent is analysing data quality…"),
+        "tool_execution":           ("🔧", "Executing custom data quality function…"),
+        "generate_report":          ("📋", "Generating the final quality report…"),
+    }
+
     if run_button and df is not None:
-        with st.spinner("Agent is analyzing the data (this may take a minute)..."):
+        st.session_state["thread_id"] = str(uuid.uuid4())
+        st.session_state["chat_history"] = []
+
+        app_graph = build_data_quality_graph(checkpointer=st.session_state["checkpointer"])
+        config    = {"configurable": {"thread_id": st.session_state["thread_id"]}}
+        initial_state = {
+            "df_json": df.to_json(orient="records"),
+            "user_context_prompt": user_context,
+            "function_results_summary": {}, "messages": [],
+            "issues": [], "bad_indices_per_column": {}, "report": "",
+        }
+
+        final_state = None
+        error_msg   = None
+
+        with st.status("🚀 Starting analysis pipeline…", expanded=True) as run_status:
+            step_placeholder = st.empty()
             try:
-                # Generate a new unique thread for this analysis and wipe old chat history
-                st.session_state["thread_id"] = str(uuid.uuid4())
-                st.session_state["chat_history"] = []
-                
-                # Checkpointer state config (Uses SQLite Checkpoints)
-                app_graph = build_data_quality_graph(checkpointer=st.session_state["checkpointer"])
-                
-                config = {"configurable": {"thread_id": st.session_state["thread_id"]}}
-                
-                initial_state = {
-                    "df_json": df.to_json(orient="records"), "user_context_prompt": user_context,
-                    "function_results_summary": {}, "messages": [],
-                    "issues": [], "bad_indices_per_column": {}, "report": ""
-                }
-                
-                # Run the Agent with thread config
-                final_state = app_graph.invoke(initial_state, config)
-                st.session_state["report"] = final_state.get("report", "No report generated.")
-                st.session_state["annotated_df"] = df
-                st.session_state["agent_state"] = final_state
-                
-                # Build Knowledge Graph JSON and HTML
-                try:
-                    st.session_state["kg_html"] = kg_builder.build_knowledge_graph(df, "data/knowledge_graph.json")
-                except Exception as kg_err:
-                    st.error(f"Error building knowledge graph: {kg_err}")
-                    
-                st.session_state["analysis_done"] = True
-                st.rerun() # Refresh to show results
-                
+                tool_call_count = 0
+                for chunk in app_graph.stream(initial_state, config, stream_mode="updates"):
+                    # chunk is {node_name: state_delta}
+                    for node_name, node_output in chunk.items():
+                        icon, label = _NODE_LABELS.get(node_name, ("🔄", f"Running `{node_name}`…"))
+
+                        # Special-case: tool_execution — show which tool was called
+                        if node_name == "tool_execution":
+                            tool_call_count += 1
+                            msgs = node_output.get("messages", [])
+                            tool_names = [
+                                m.get("name", "tool") if isinstance(m, dict) else getattr(m, "name", "tool")
+                                for m in msgs
+                            ]
+                            tool_str = ", ".join(set(tool_names)) or "custom function"
+                            label = f"🔧 Executing tool: `{tool_str}` (call #{tool_call_count})…"
+                            icon  = "🔧"
+
+                        # Special-case: knowledge_agent — show retry count
+                        if node_name == "knowledge_agent":
+                            retry = node_output.get("kb_retry_count", 0)
+                            if retry and retry > 1:
+                                label = f"🔍 Rebuilding knowledge base (attempt {retry}/3)…"
+
+                        # Special-case: critique_agent — show score if available
+                        if node_name == "critique_agent":
+                            critique = node_output.get("kb_critique", {})
+                            if critique:
+                                scores = critique.get("scores", {})
+                                avg = round(sum(scores.values()) / 4, 1) if scores else "?"
+                                status_word = "✅ Approved" if critique.get("status") == "approved" else "❌ Rejected"
+                                label = f"🧐 Knowledge base critique complete — {status_word} · avg score {avg}/10"
+
+                        step_placeholder.markdown(f"{icon} **{label}**")
+                        run_status.update(label=f"{icon} {label}")
+
+                        # Capture the final state from the last non-empty chunk
+                        if node_output:
+                            if final_state is None:
+                                final_state = dict(initial_state)
+                            final_state.update(node_output)
+
+                run_status.update(label="✅ Analysis complete!", state="complete", expanded=False)
+                step_placeholder.empty()
+
             except Exception as e:
+                error_msg = str(e)
+                run_status.update(label="❌ Analysis failed", state="error", expanded=True)
                 st.error(f"An error occurred during analysis: {e}")
+
+        if final_state and not error_msg:
+            st.session_state["report"]       = final_state.get("report", "No report generated.")
+            st.session_state["annotated_df"] = df
+            st.session_state["agent_state"]  = final_state
+            try:
+                st.session_state["kg_html"] = kg_builder.build_knowledge_graph(df, "data/knowledge_graph.json")
+            except Exception as kg_err:
+                st.error(f"Error building knowledge graph: {kg_err}")
+            st.session_state["analysis_done"] = True
+            st.rerun()
 
     # If analysis is complete, show the report
     if st.session_state.get("analysis_done", False) and st.session_state["agent_state"]:
@@ -297,15 +401,29 @@ with tab1:
             with st.chat_message("user"):
                 st.markdown(prompt)
                 
-            with st.spinner("Analyzing follow-up..."):
+            with st.status("🧠 Analysing follow-up…", expanded=True) as chat_status:
+                chat_placeholder = st.empty()
                 from langchain_core.messages import HumanMessage
                 app = build_data_quality_graph(checkpointer=st.session_state["checkpointer"])
                 config = {"configurable": {"thread_id": st.session_state["thread_id"]}}
-                
-                # Thanks to the conditional entry point, it bypasses the orchestrator node!
-                new_state = app.invoke({"messages": [HumanMessage(content=prompt)]}, config)
-                
-                ai_response = new_state["messages"][-1].content
+
+                follow_state = None
+                for chunk in app.stream({"messages": [HumanMessage(content=prompt)]}, config, stream_mode="updates"):
+                    for node_name, node_output in chunk.items():
+                        icon, label = _NODE_LABELS.get(node_name, ("🔄", f"Running `{node_name}`…"))
+                        if node_name == "tool_execution":
+                            msgs = node_output.get("messages", [])
+                            tool_names = [m.get("name","tool") if isinstance(m,dict) else getattr(m,"name","tool") for m in msgs]
+                            label = f"🔧 Executing tool: `{', '.join(set(tool_names)) or 'custom function'}`…"
+                        chat_placeholder.markdown(f"{icon} **{label}**")
+                        chat_status.update(label=f"{icon} {label}")
+                        if node_output:
+                            follow_state = node_output
+
+                chat_status.update(label="✅ Done", state="complete", expanded=False)
+                chat_placeholder.empty()
+
+                ai_response = follow_state["messages"][-1].content if follow_state and follow_state.get("messages") else "No response."
                 st.session_state["chat_history"].append({"role": "assistant", "content": ai_response})
                 st.rerun()
 
