@@ -9,3 +9,13 @@ env/
 # Python
 __pycache__/
 *.pyc
+*.pyo
+
+# SQLite database files (runtime state — not source code)
+database/app.db
+database/app.db-shm
+database/app.db-wal
+
+# Generated / runtime data
+data/knowledge_critique_log.md
+data/knowledge_graph.json

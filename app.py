@@ -1,5 +1,6 @@
 import streamlit as st
 import os
+import io
 import pandas as pd
 import os
 from dotenv import load_dotenv # Ensure the local modules can be found
@@ -49,7 +50,47 @@ else:
 if not api_key_set:
     st.info("Please set your API key in the `.env` file and restart the application.")
     st.stop()
-    
+
+# ── LLM endpoint connectivity pre-check ──────────────────────────────────────
+def _check_llm_endpoint() -> tuple[bool, str]:
+    """
+    Quick TCP-level check (≤5 s) so we surface a clear error before the
+    agent pipeline runs and hangs for minutes.
+    Private IP endpoints (10.x / 172.x / 192.168.x) are tested directly,
+    bypassing the Zscaler corporate proxy which cannot reach private subnets.
+    """
+    import socket
+    if os.getenv("USE_AZURE_OPENAI", "false").lower() == "true":
+        raw = os.getenv("AZURE_OPENAI_ENDPOINT", "")
+    else:
+        raw = "https://api.openai.com"
+
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(raw)
+        host = parsed.hostname or raw
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        sock = socket.create_connection((host, port), timeout=5)
+        sock.close()
+        return True, ""
+    except Exception as e:
+        return False, f"`{raw}` — {type(e).__name__}: {e}"
+
+if "llm_endpoint_ok" not in st.session_state:
+    ok, reason = _check_llm_endpoint()
+    st.session_state["llm_endpoint_ok"] = ok
+    st.session_state["llm_endpoint_reason"] = reason
+
+if not st.session_state["llm_endpoint_ok"]:
+    st.error(
+        f"⚠️ **LLM endpoint is unreachable.** The analysis will fail until this is resolved.\n\n"
+        f"**Endpoint:** {st.session_state['llm_endpoint_reason']}\n\n"
+        f"Possible fixes:\n"
+        f"- Confirm `AZURE_OPENAI_ENDPOINT` / `OPENAI_API_KEY` in your `.env` file are correct.\n"
+        f"- Check that this server has network access to the endpoint (firewall / VPN / proxy).\n"
+        f"- If using a private Azure endpoint (e.g. `http://10.x.x.x`), ensure the network route is up."
+    )
+
 # Initialize session state variables if they don't exist
 if "report" not in st.session_state:
     st.session_state["report"] = None

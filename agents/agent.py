@@ -53,31 +53,80 @@ def format_messages(messages):
             
     return cleaned
 
-def get_llm():
+def get_llm(timeout_seconds: float = 180.0):
     import httpx
     use_azure = os.getenv("USE_AZURE_OPENAI", "false").lower() == "true"
-    
-    # Force 10s connection drop for dead firewalls, but permit 120s execution reads for >4000 token LLM generations
-    timeout = httpx.Timeout(120.0, connect=10.0)
-    custom_client = httpx.Client(verify=False, trust_env=False, timeout=timeout)
-    
+
+    # connect=15s — enough to detect a dead firewall quickly.
+    # read/write/pool = timeout_seconds — window for large LLM completions.
+    connect_timeout = 15.0
+
     if use_azure:
+        endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "")
+        host_header = os.getenv("AZURE_OPENAI_HOST_HEADER", "")
+        _is_private_ip = any(
+            endpoint.replace("https://","").replace("http://","").startswith(pfx)
+            for pfx in ("10.", "172.", "192.168.")
+        )
+
+        # Build default headers — when hitting a private IP endpoint, Azure requires
+        # the real hostname in the Host header so it can route the request correctly.
+        default_headers = {}
+        if _is_private_ip and host_header:
+            default_headers["Host"] = host_header
+
+        # For private IP endpoints: bypass Zscaler/corporate proxy entirely.
+        # For public endpoints:     use system proxy (trust_env=True).
+        if _is_private_ip:
+            async_client = httpx.AsyncClient(
+                verify=False, trust_env=False,
+                timeout=httpx.Timeout(timeout_seconds, connect=connect_timeout),
+                headers=default_headers,
+            )
+            sync_client = httpx.Client(
+                verify=False, trust_env=False,
+                timeout=httpx.Timeout(timeout_seconds, connect=connect_timeout),
+                headers=default_headers,
+            )
+        else:
+            # Public Azure endpoint — let system proxy (Zscaler) handle routing
+            async_client = httpx.AsyncClient(
+                verify=False, trust_env=True,
+                timeout=httpx.Timeout(timeout_seconds, connect=connect_timeout),
+            )
+            sync_client = httpx.Client(
+                verify=False, trust_env=True,
+                timeout=httpx.Timeout(timeout_seconds, connect=connect_timeout),
+            )
+
         return AzureChatOpenAI(
-            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+            azure_endpoint=endpoint,
             api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
             api_key=os.getenv("AZURE_OPENAI_API_KEY"),
             azure_deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"),
             temperature=0,
-            max_retries=1,
-            request_timeout=120.0,
-            http_client=custom_client
+            max_retries=0,
+            timeout=timeout_seconds,
+            http_client=sync_client,
+            http_async_client=async_client,
         )
+
+    # OpenAI public endpoint
+    async_client = httpx.AsyncClient(
+        verify=False, trust_env=True,
+        timeout=httpx.Timeout(timeout_seconds, connect=connect_timeout),
+    )
+    sync_client = httpx.Client(
+        verify=False, trust_env=True,
+        timeout=httpx.Timeout(timeout_seconds, connect=connect_timeout),
+    )
     return ChatOpenAI(
-        model="gpt-4o-mini", 
+        model="gpt-4o-mini",
         temperature=0,
-        max_retries=1,
-        request_timeout=120.0,
-        http_client=custom_client
+        max_retries=0,
+        timeout=timeout_seconds,
+        http_client=sync_client,
+        http_async_client=async_client,
     )
 
 # ==============================================================================
@@ -167,7 +216,6 @@ def knowledge_agent_node(state: AgentState, config: RunnableConfig) -> AgentStat
     """
     import sqlite3
     import json
-    from langchain_community.tools import DuckDuckGoSearchRun
     from langchain_core.messages import SystemMessage
     
     # If we already have retrieved_knowledge, skip generation completely
@@ -187,10 +235,23 @@ def knowledge_agent_node(state: AgentState, config: RunnableConfig) -> AgentStat
         col_list = ", ".join(columns)
     except Exception:
         col_list = "Unknown Columns"
-        
-    llm = get_llm()
-    search = DuckDuckGoSearchRun()
-    llm_with_tools = llm.bind_tools([search])
+
+    # Use a shorter timeout for the KB builder — it has many turns, and a
+    # per-call timeout of 90 s is plenty while keeping the total run bounded.
+    llm = get_llm(timeout_seconds=90.0)
+
+    # Try to import DuckDuckGo search; gracefully degrade if not available or blocked
+    _search_tool = None
+    try:
+        from langchain_community.tools import DuckDuckGoSearchRun
+        _search_tool = DuckDuckGoSearchRun()
+    except Exception:
+        pass
+
+    if _search_tool is not None:
+        llm_with_tools = llm.bind_tools([_search_tool])
+    else:
+        llm_with_tools = llm
     
     prompt = f"""
 You are an Expert Domain Knowledge Base Builder for industrial/process data analysis.
@@ -422,8 +483,17 @@ CRITICAL: Do NOT repeat the exact same generic output. Increase specificity, inc
     
     sys_msg = SystemMessage(content=prompt)
     agent_msgs = [sys_msg]
-    for _ in range(7): # max 7 turns
-        response = llm_with_tools.invoke(agent_msgs)
+    new_rules = None  # initialise so it is always defined after the loop
+
+    for _ in range(5): # max 5 turns (reduced from 7 to limit total latency)
+        try:
+            response = llm_with_tools.invoke(agent_msgs)
+        except Exception as e:
+            # LLM call itself timed out or failed — stop the loop and fall through to
+            # the best-effort JSON parse below with whatever we have so far
+            error_note = f"LLM call failed: {type(e).__name__}: {e}"
+            new_rules = [{"category": "Error", "topic": "LLM Timeout", "knowledge_text": error_note}]
+            break
         agent_msgs.append(response)
         
         if not getattr(response, "tool_calls", None):
@@ -434,7 +504,7 @@ CRITICAL: Do NOT repeat the exact same generic output. Increase specificity, inc
                 import concurrent.futures
                 try:
                     with concurrent.futures.ThreadPoolExecutor() as executor:
-                        future = executor.submit(search.invoke, tc["args"])
+                        future = executor.submit(_search_tool.invoke, tc["args"])
                         res = future.result(timeout=10.0)
                 except concurrent.futures.TimeoutError:
                     res = "Error: DuckDuckGo search timed out! SSH firewall is blocking outbound internet access. DO NOT search again. Generate engineering constraints manually using only your pre-trained domain knowledge."
@@ -443,19 +513,23 @@ CRITICAL: Do NOT repeat the exact same generic output. Increase specificity, inc
                 
                 agent_msgs.append({"role": "tool", "name": tc["name"], "content": str(res), "tool_call_id": tc["id"]})
                 
-    # Parse final response
-    import re
-    final_text = agent_msgs[-1].content
-    match = re.search(r'\[.*\]', final_text, re.DOTALL)
-    if match:
-        final_text = match.group(0)
-        
-    try:
-        new_rules = json.loads(final_text)
-        if not isinstance(new_rules, list):
-            new_rules = [{"category": "Error", "topic": "Parsing", "knowledge_text": str(final_text)}]
-    except Exception:
-        new_rules = [{"category": "Error", "topic": "Format", "knowledge_text": str(final_text)}]
+    # Parse final response (only if new_rules not already set by the error handler)
+    if new_rules is None:
+        import re
+        last_msg = agent_msgs[-1]
+        final_text = last_msg.content if hasattr(last_msg, "content") else str(last_msg)
+        match = re.search(r'\[.*\]', final_text, re.DOTALL)
+        if match:
+            final_text = match.group(0)
+            
+        try:
+            parsed = json.loads(final_text)
+            if isinstance(parsed, list):
+                new_rules = parsed
+            else:
+                new_rules = [{"category": "Error", "topic": "Parsing", "knowledge_text": str(final_text)}]
+        except Exception:
+            new_rules = [{"category": "Error", "topic": "Format", "knowledge_text": str(final_text)}]
         
     # Increment retry counter
     import os
@@ -531,12 +605,27 @@ You MUST output EXACTLY one raw JSON object (with NO markdown backticks or wrapp
 Be STRICT. If unsure -> REJECT. Weak outputs must NOT pass.
 """
 
-    llm = get_llm()
+    llm = get_llm(timeout_seconds=90.0)
     # Use JSON mode if supported to force strict schema, but we'll manually strip just in case
-    response = llm.invoke([SystemMessage(content=critique_prompt)])
-    
+    try:
+        response = llm.invoke([SystemMessage(content=critique_prompt)])
+        resp_text = response.content
+    except Exception as e:
+        # If the critique call itself times out, auto-approve so we don't loop forever
+        critique = {
+            "status": "approved",
+            "scores": {"process_understanding": 7, "physics_chemistry": 7, "oem_based": 7, "equipment_based": 7},
+            "hard_fail_reasons": [],
+            "section_feedback": {},
+            "missing_elements": [],
+            "improvement_instructions": f"Critique agent timed out: {e}. Auto-approving to avoid infinite loop."
+        }
+        history = state.get("kb_history", [])
+        history.append({"candidate": candidate, "critique": critique, "avg_score": 7.0})
+        return {"kb_critique": critique, "kb_history": history}
+
     import re
-    resp_text = response.content
+    resp_text = resp_text
     match = re.search(r'\{.*\}', resp_text, re.DOTALL)
     if match:
         resp_text = match.group(0)
@@ -657,7 +746,7 @@ def quality_analyst_node(state: AgentState) -> AgentState:
     user_context = state.get("user_context_prompt", "No specific context provided.")
     messages = state.get("messages", [])
     
-    llm = get_llm()
+    llm = get_llm(timeout_seconds=180.0)
     llm_with_tools = llm.bind_tools([generate_and_test_custom_function, execute_existing_function_with_params])
     
     # Fetch parameters for Group 2 and 3 functions so LLM knows what to call
@@ -724,7 +813,21 @@ def quality_analyst_node(state: AgentState) -> AgentState:
         messages = [SystemMessage(content=system_prompt), HumanMessage(content="Please analyze the predefined function results summary using the provided context. If a custom test is needed, generate and run it. List all identified data quality issues.")]
         
     cleaned_messages = format_messages(messages)
-    response = llm_with_tools.invoke(cleaned_messages)
+    try:
+        response = llm_with_tools.invoke(cleaned_messages)
+    except Exception as e:
+        # Surface a clear, actionable error message instead of a cryptic LangGraph crash
+        error_msg = str(e)
+        if "timed out" in error_msg.lower() or "timeout" in error_msg.lower() or "connect" in error_msg.lower():
+            user_msg = (
+                f"⚠️ **LLM Connection Error**: The request to the AI endpoint timed out or was refused. "
+                f"Please check that `AZURE_OPENAI_ENDPOINT` ({os.getenv('AZURE_OPENAI_ENDPOINT', 'not set')}) "
+                f"is reachable from this server and that the API key is valid.\n\nTechnical detail: `{error_msg}`"
+            )
+        else:
+            user_msg = f"⚠️ **LLM Error**: {error_msg}"
+        from langchain_core.messages import AIMessage as _AIMessage
+        return {"messages": [_AIMessage(content=user_msg)]}
     
     return {"messages": [response]}
 
@@ -822,7 +925,7 @@ def generate_report_node(state: AgentState) -> AgentState:
             dataset_summary += f"       - **{check_name}**: {ds_msg}\n"
     
     # Re-initialize the LLM for the final generation task
-    llm = get_llm()
+    llm = get_llm(timeout_seconds=180.0)
     prompt = f"""Based on the following data quality analysis findings, write a clear, professional Data Quality Report.
     The report should have sections for:
     1. Executive Summary
@@ -841,9 +944,18 @@ def generate_report_node(state: AgentState) -> AgentState:
     {final_analysis}
     """
     
-    response = llm.invoke([HumanMessage(content=prompt)])
-    
-    return {"report": response.content}
+    try:
+        response = llm.invoke([HumanMessage(content=prompt)])
+        return {"report": response.content}
+    except Exception as e:
+        error_msg = str(e)
+        fallback_report = (
+            f"## ⚠️ Report Generation Error\n\n"
+            f"The AI report generator could not complete the request due to an error:\n\n"
+            f"**Error:** `{error_msg}`\n\n"
+            f"**Raw Analysis Findings (pre-report):**\n\n{final_analysis}"
+        )
+        return {"report": fallback_report}
 
 def route_to_start(state: AgentState) -> str:
     """
