@@ -517,4 +517,4 @@ with tab4:
 with tab5:
     st.header("Agent Workflow Diagram")
     st.markdown("Interactive graph of the LangGraph pipeline. **Drag nodes**, scroll to zoom, hover for descriptions.")
-    components.html(ui_components.get_workflow_graph_html(), height=620)
+    components.html(ui_components.get_workflow_graph_html(), height=680)

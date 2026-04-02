@@ -7,6 +7,16 @@ from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, Tool
 import operator
 from operations.predefined import run_all_verified_functions
 from agents.tools import generate_and_test_custom_function, set_current_df, execute_existing_function_with_params
+from prompts.knowledge_agent_prompts import (
+    get_process_prompt,
+    get_physics_prompt,
+    get_equipment_prompt,
+    get_oem_prompt,
+    get_critique_injection,
+    get_critique_prompt,
+)
+from prompts.analyst_prompts import get_analyst_system_prompt
+from prompts.report_prompts import get_report_prompt
 
 # Define the LangGraph State type
 # This state dictionary is passed between every node in the graph.
@@ -216,6 +226,7 @@ def knowledge_agent_node(state: AgentState, config: RunnableConfig) -> AgentStat
     """
     import sqlite3
     import json
+    from langchain_community.tools import DuckDuckGoSearchRun
     from langchain_core.messages import SystemMessage
     
     # If we already have retrieved_knowledge, skip generation completely
@@ -235,303 +246,89 @@ def knowledge_agent_node(state: AgentState, config: RunnableConfig) -> AgentStat
         col_list = ", ".join(columns)
     except Exception:
         col_list = "Unknown Columns"
-
-    # Use a shorter timeout for the KB builder — it has many turns, and a
-    # per-call timeout of 90 s is plenty while keeping the total run bounded.
-    llm = get_llm(timeout_seconds=90.0)
-
-    # Try to import DuckDuckGo search; gracefully degrade if not available or blocked
-    _search_tool = None
-    try:
-        from langchain_community.tools import DuckDuckGoSearchRun
-        _search_tool = DuckDuckGoSearchRun()
-    except Exception:
-        pass
-
-    if _search_tool is not None:
-        llm_with_tools = llm.bind_tools([_search_tool])
-    else:
-        llm_with_tools = llm
-    
-    prompt = f"""
-You are an Expert Domain Knowledge Base Builder for industrial/process data analysis.
-
-You are building a permanent technical knowledge base for a single chat session. This knowledge base will be used as the fixed engineering reference for all downstream follow-up questions in the chat. Therefore, the output must be specific, technically rigorous, practically useful, and tightly aligned to the dataset variables.
-
-USER CONTEXT:
-{user_context}
-
-DATASET VARIABLES / COLUMNS:
-{col_list}
-
-PRIMARY OBJECTIVE:
-Generate a high-quality domain knowledge base tailored specifically to the user context and the listed dataset variables/columns.
-
-SEARCH INSTRUCTION:
-Use the duckduckgo_search tool extensively and intelligently to gather relevant information. Search deeply for:
-- process understanding related to the variables
-- physics and chemistry relationships governing the variables
-- equipment behavior, constraints, and operational relevance
-- OEM/vendor/manual/spec-limit style guidance where available
-
-Do not rely on generic industrial boilerplate. Prioritize information that can help interpret, troubleshoot, validate, and reason about the actual variables in this dataset.
-
---------------------------------------------------
-CORE REQUIREMENTS
---------------------------------------------------
-
-You must output exactly 4 JSON objects inside a single JSON array.
-
-Each JSON object must contain exactly these 3 keys:
-- "category"
-- "topic"
-- "knowledge_text"
-
-The 4 categories must be exactly:
-1. "Process"
-2. "Physics/Chemistry"
-3. "Equipment"
-4. "OEM"
-
-Do not output markdown.
-Do not output commentary.
-Do not output any keys other than the 3 required keys.
-Output only the raw JSON array.
-
---------------------------------------------------
-GLOBAL QUALITY STANDARD
---------------------------------------------------
-
-Each section must be written as if it will be used by an engineer or analyst to interpret process data from this exact dataset.
-
-This means each section must:
-- explicitly reference the kinds of variables present in the dataset
-- explain how these variables are used in interpretation
-- include operating logic, constraints, cause-effect relationships, and analytical relevance
-- avoid vague statements such as "temperature is important" unless followed by specific engineering interpretation
-- avoid filler, repetition, and generic textbook explanation
-- include practical reasoning useful for anomaly detection, diagnostics, root cause analysis, and follow-up Q&A
-
-Each "knowledge_text" must be:
-- highly detailed
-- multi-paragraph
-- comprehensive
-- at least 900 words
-- tailored to the given context and variables
-
---------------------------------------------------
-VARIABLE GROUNDING RULES
---------------------------------------------------
-
-Before writing, infer likely variable types from the dataset columns, such as:
-- temperature
-- pressure
-- flow
-- level
-- composition
-- pH
-- speed
-- current
-- vibration
-- valve position
-- control signals
-- utility variables
-- equipment tags
-- alarms/status indicators
-
-You must ground the knowledge base in these variables.
-
-For every section:
-- mention representative variables or variable groups from the dataset
-- explain what those variables likely indicate in operation
-- explain how changes in one variable may affect others
-- explain how analysts should interpret these variables together, not in isolation
-
-If exact equipment/process identity is uncertain, make careful engineering inferences from naming patterns, but do not invent highly specific plant facts unless supported by the variable names and search results.
-
---------------------------------------------------
-SECTION-SPECIFIC INSTRUCTIONS
---------------------------------------------------
-
-SECTION 1: PROCESS
-Category must be "Process"
-
-Topic should summarize the process understanding for the dataset.
-
-The Process section must:
-- explain the likely process flow and operational sequence implied by the variables
-- describe how material, energy, or utility streams likely move through the system
-- explain upstream/downstream relationships between variable groups
-- identify likely control points, bottlenecks, recirculation loops, heat exchange stages, separation stages, reaction stages, or utility interactions if relevant
-- explain what “normal operation” would mean in terms of variable patterns
-- explain what abnormal patterns may indicate
-- connect process behavior to the user context, not just generic plant theory
-- help a downstream analyst understand the system holistically from a process perspective
-
-This section should read like a process-engineering operating interpretation manual tailored to the dataset.
-
-SECTION 2: PHYSICS/CHEMISTRY
-Category must be "Physics/Chemistry"
-
-Topic should summarize the governing physical and chemical principles for the dataset.
-
-The Physics/Chemistry section must:
-- explain the physical laws, thermodynamics, fluid mechanics, heat transfer, mass transfer, reaction behavior, equilibrium behavior, or chemical interactions relevant to the variables
-- include equations, proportionalities, or directional relationships wherever useful
-- explain how variables such as temperature, pressure, flow, concentration, and level interact physically
-- describe expected first-principles behavior, including nonlinearities, delays, coupling, and trade-offs
-- explain what variable combinations may violate physical expectations and therefore signal bad data, fouling, sensor issues, leaks, instability, or process upset
-- include engineering reasoning that can support validation, feature engineering, and anomaly detection
-- avoid becoming a generic chemistry textbook; tie every major concept back to likely variable interpretation in this dataset
-
-This section should read like a first-principles diagnostic reference for the actual data.
-
-SECTION 3: EQUIPMENT
-Category must be "Equipment"
-
-Topic should summarize the equipment-level interpretation for the dataset.
-
-The Equipment section must:
-- identify likely equipment classes implied by the variables, such as pumps, compressors, blowers, fans, heat exchangers, columns, tanks, reactors, scrubbers, filters, valves, condensers, evaporators, separators, conveyors, motors, and instrumentation loops
-- explain what each equipment class does and how its health/performance appears in process data
-- describe expected input-output variable relationships for each equipment type
-- explain common failure modes and how they appear in variables
-- discuss control behavior, operating constraints, and performance degradation patterns
-- explain what analysts should look for in pressure, flow, temperature, level, current, differential pressure, vibration, or valve movement data
-- distinguish process-side issues from equipment-side issues where possible
-- make the section useful for troubleshooting and engineering interpretation of actual tags/variables
-
-This section should read like a practical equipment troubleshooting and interpretation guide for the dataset.
-
-SECTION 4: OEM
-Category must be "OEM"
-
-Topic should summarize OEM/manual/specification style constraints relevant to the dataset.
-
-The OEM section must:
-- focus on specification-style guidance, design envelopes, operating windows, alarm/trip philosophies, maintenance recommendations, and vendor/manual style constraints
-- include realistic types of OEM considerations such as allowable temperature limits, pressure ranges, flow operating windows, NPSH considerations, fouling margins, vibration thresholds, motor loading considerations, control valve sizing implications, exchanger approach temperatures, separator residence times, pump/compressor operating regions, and instrument accuracy/response limitations where relevant
-- clearly distinguish between hard OEM limits, common industry guidance, and inferred good engineering practice
-- state when exact OEM values are equipment-specific and should be validated against actual manuals
-- provide the analyst with actionable “do not over-interpret beyond this limit” style cautionary guidance
-- help downstream users understand what kinds of boundaries, thresholds, and reliability limits matter when analyzing the dataset
-
-This section should read like a vendor/OEM/specification-oriented engineering reference, even when exact vendor data is not available.
-
---------------------------------------------------
-ANTI-GENERIC RULES
---------------------------------------------------
-
-Do NOT do any of the following:
-- do not write shallow summaries
-- do not repeat the same content across sections
-- do not use generic filler to reach word count
-- do not provide generic safety disclaimers unless directly relevant
-- do not describe broad industrial concepts without linking them to likely variables in this dataset
-- do not invent precise OEM numbers unless they are strongly supported by search results or standard engineering practice
-- do not produce near-duplicate paragraphs across Process / Physics / Equipment / OEM
-
-Each section must feel distinct in purpose:
-- Process = system flow and operating logic
-- Physics/Chemistry = first-principles governing behavior
-- Equipment = asset-level interpretation and failure behavior
-- OEM = specification limits, envelopes, vendor-style constraints, caution boundaries
-
---------------------------------------------------
-OUTPUT FORMAT EXAMPLE STRUCTURE
---------------------------------------------------
-
-[
-  {{
-    "category": "Process",
-    "topic": "....",
-    "knowledge_text": "...."
-  }},
-  {{
-    "category": "Physics/Chemistry",
-    "topic": "....",
-    "knowledge_text": "...."
-  }},
-  {{
-    "category": "Equipment",
-    "topic": "....",
-    "knowledge_text": "...."
-  }},
-  {{
-    "category": "OEM",
-    "topic": "....",
-    "knowledge_text": "...."
-  }}
-]
-
-Return only the raw JSON array.
-"""
-             
-    if critique:
-        prompt += f"""
         
-WARNING: Your previous attempt was REJECTED by the Critique Agent.
-You MUST specifically address the following feedback and improve the output, or you will fail again.
-Scores (out of 10): {json.dumps(critique.get('scores', {}))}
-Hard Fail Reasons: {json.dumps(critique.get('hard_fail_reasons', []))}
-Specific Section Feedback: {json.dumps(critique.get('section_feedback', {}))}
-Missing Elements: {json.dumps(critique.get('missing_elements', []))}
-Improvement Instructions: {critique.get('improvement_instructions', 'Improve specificity and depth.')}
-
-CRITICAL: Do NOT repeat the exact same generic output. Increase specificity, include process-level reasoning, and align tightly with the dataset variables.
-"""
+    llm = get_llm()
+    search = DuckDuckGoSearchRun()
+    llm_with_tools = llm.bind_tools([search])
     
-    sys_msg = SystemMessage(content=prompt)
-    agent_msgs = [sys_msg]
-    new_rules = None  # initialise so it is always defined after the loop
+    # --- 1. SET UP THE 4 MODULAR PROMPTS (loaded from prompts/ package) ---
+    import os
 
-    for _ in range(5): # max 5 turns (reduced from 7 to limit total latency)
+    def load_sample(filename: str) -> str:
+        filepath = os.path.join("docs", filename)
         try:
-            response = llm_with_tools.invoke(agent_msgs)
-        except Exception as e:
-            # LLM call itself timed out or failed — stop the loop and fall through to
-            # the best-effort JSON parse below with whatever we have so far
-            error_note = f"LLM call failed: {type(e).__name__}: {e}"
-            new_rules = [{"category": "Error", "topic": "LLM Timeout", "knowledge_text": error_note}]
-            break
-        agent_msgs.append(response)
+            with open(filepath, "r", encoding="utf-8") as f:
+                return f.read()
+        except Exception:
+            return "No reference sample provided."
+
+    process_sample  = load_sample("Process_sample.txt")
+    physics_sample  = load_sample("Physics_Chemistry_sample.txt")
+    equipment_sample = load_sample("Equipment_sample.txt")
+    oem_sample      = load_sample("OEM_sample.txt")
+
+    critique_injection = get_critique_injection(critique)
+
+    # Bundle prompts — each builder function lives in prompts/knowledge_agent_prompts.py
+    split_prompts = [
+        ("Process",          get_process_prompt(user_context, col_list, process_sample)   + critique_injection),
+        ("Physics/Chemistry", get_physics_prompt(user_context, col_list, physics_sample)  + critique_injection),
+        ("Equipment",        get_equipment_prompt(user_context, col_list, equipment_sample) + critique_injection),
+        ("OEM",              get_oem_prompt(user_context, col_list, oem_sample)           + critique_injection),
+    ]
+
+    import concurrent.futures
+    import re
+    
+    def process_single_section(name: str, section_prompt: str) -> dict:
+        sys_msg = SystemMessage(content=section_prompt)
+        agent_msgs = [sys_msg]
         
-        if not getattr(response, "tool_calls", None):
-            break
+        for _ in range(5):  # Max 5 turns for tool loop
+            response = llm_with_tools.invoke(agent_msgs)
+            agent_msgs.append(response)
             
-        for tc in response.tool_calls:
-            if tc["name"] in ["duckduckgo_search", "duckduckgo_results_json"]: 
-                import concurrent.futures
-                try:
-                    with concurrent.futures.ThreadPoolExecutor() as executor:
-                        future = executor.submit(_search_tool.invoke, tc["args"])
-                        res = future.result(timeout=10.0)
-                except concurrent.futures.TimeoutError:
-                    res = "Error: DuckDuckGo search timed out! SSH firewall is blocking outbound internet access. DO NOT search again. Generate engineering constraints manually using only your pre-trained domain knowledge."
-                except Exception as e:
-                    res = f"Search failed: {e}"
+            if not getattr(response, "tool_calls", None):
+                break
                 
-                agent_msgs.append({"role": "tool", "name": tc["name"], "content": str(res), "tool_call_id": tc["id"]})
-                
-    # Parse final response (only if new_rules not already set by the error handler)
-    if new_rules is None:
-        import re
-        last_msg = agent_msgs[-1]
-        final_text = last_msg.content if hasattr(last_msg, "content") else str(last_msg)
-        match = re.search(r'\[.*\]', final_text, re.DOTALL)
+            for tc in response.tool_calls:
+                if tc["name"] in ["duckduckgo_search", "duckduckgo_results_json"]: 
+                    try:
+                        # Direct invoke since we are already inside a threaded executor
+                        res = search.invoke(tc["args"])
+                    except Exception as e:
+                        res = f"Search failed: {{e}}. Generate constraints manually."
+                    
+                    agent_msgs.append({"role": "tool", "name": tc["name"], "content": str(res), "tool_call_id": tc["id"]})
+                    
+        # Extract individual JSON
+        final_text = agent_msgs[-1].content
+        match = re.search(r'\{.*\}', final_text, re.DOTALL)
         if match:
             final_text = match.group(0)
             
         try:
-            parsed = json.loads(final_text)
-            if isinstance(parsed, list):
-                new_rules = parsed
-            else:
-                new_rules = [{"category": "Error", "topic": "Parsing", "knowledge_text": str(final_text)}]
+            return json.loads(final_text)
         except Exception:
-            new_rules = [{"category": "Error", "topic": "Format", "knowledge_text": str(final_text)}]
-        
-    # Increment retry counter
+            return {"category": name, "topic": "Format Error", "knowledge_text": str(final_text)}
+
+    # Parallel Execution for Mega-Prompt Splitting (Massive performance speedup)
+    final_kb = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        future_to_name = {executor.submit(process_single_section, name, p): name for name, p in split_prompts}
+        for future in concurrent.futures.as_completed(future_to_name):
+            try:
+                res_json = future.result()
+                final_kb.append(res_json)
+            except Exception as e:
+                name = future_to_name[future]
+                final_kb.append({"category": name, "topic": "Execution Error", "knowledge_text": str(e)})
+
+    # Enforce correct category sorting so it stays 1. Process 2. Physics 3. Equipment 4. OEM
+    order_map = {"Process": 1, "Physics/Chemistry": 2, "Equipment": 3, "OEM": 4}
+    final_kb.sort(key=lambda x: order_map.get(x.get("category", ""), 99))
+
+    # Log and Return
     import os
     os.makedirs("data", exist_ok=True)
     thread_id = config.get("configurable", {}).get("thread_id", "global")
@@ -540,12 +337,12 @@ CRITICAL: Do NOT repeat the exact same generic output. Increase specificity, inc
         with open("data/knowledge_critique_log.md", mode, encoding="utf-8") as f:
             if retry_count == 0:
                 f.write(f"# Knowledge Creation Log (Thread: {thread_id})\n")
-            f.write(f"\n## Knowledge Agent Attempt {retry_count + 1}\n")
-            f.write(f"```json\n{json.dumps(new_rules, indent=2)}\n```\n")
+            f.write(f"\n## Knowledge Agent Attempt {retry_count + 1} (Multi-Prompt Threaded)\n")
+            f.write(f"```json\n{json.dumps(final_kb, indent=2)}\n```\n")
     except Exception:
         pass
         
-    return {"kb_candidate": new_rules, "kb_retry_count": retry_count + 1}
+    return {"kb_candidate": final_kb, "kb_retry_count": retry_count + 1}
 
 def critique_agent_node(state: AgentState, config: RunnableConfig) -> AgentState:
     """
@@ -563,69 +360,14 @@ def critique_agent_node(state: AgentState, config: RunnableConfig) -> AgentState
         return state
         
     user_context = state.get("user_context_prompt", "")
-    critique_prompt = f"""You are a rigorous, unforgiving Knowledge Base Critique Agent. 
-Your goal is to evaluate a generated Candidate Knowledge Base for a dataset analysis task.
+    critique_prompt = get_critique_prompt(user_context, candidate)
 
-User Context: '{user_context}'
-Candidate Knowledge Base: 
-{json.dumps(candidate, indent=2)}
-
-EVALUATION FRAMEWORK:
-For EACH of the mandatory 4 sections (Process, Physics/Chemistry, OEM, Equipment), assign a score from 0 to 10:
-0-3: Poor (missing / incorrect / useless)
-4-6: Weak (generic / incomplete / shallow)
-7-8: Good (mostly correct, some gaps)
-9-10: Strong (detailed, specific, actionable)
-
-HARD FAIL CONDITIONS (Auto-Reject if ANY are true):
-- Any of the 4 sections is missing
-- Any section score < 4
-- Content is mostly generic boilerplate
-- No clear linkage to process/dataset context
-- Contradictions or obvious inaccuracies
-
-APPROVAL LOGIC:
-Approve ONLY IF:
-- All 4 sections are present
-- All section scores >= 7
-- At least 2 sections score >= 8
-- No hard fail conditions triggered
-
-OUTPUT FORMAT RULES:
-You MUST output EXACTLY one raw JSON object (with NO markdown backticks or wrappers) matching this schema exactly:
-{{
-  "status": "approved" or "rejected",
-  "scores": {{"process_understanding": int, "physics_chemistry": int, "oem_based": int, "equipment_based": int}},
-  "hard_fail_reasons": ["..."],
-  "section_feedback": {{"process_understanding": "...", "physics_chemistry": "...", "oem_based": "...", "equipment_based": "..."}},
-  "missing_elements": ["..."],
-  "improvement_instructions": "..."
-}}
-
-Be STRICT. If unsure -> REJECT. Weak outputs must NOT pass.
-"""
-
-    llm = get_llm(timeout_seconds=90.0)
+    llm = get_llm()
     # Use JSON mode if supported to force strict schema, but we'll manually strip just in case
-    try:
-        response = llm.invoke([SystemMessage(content=critique_prompt)])
-        resp_text = response.content
-    except Exception as e:
-        # If the critique call itself times out, auto-approve so we don't loop forever
-        critique = {
-            "status": "approved",
-            "scores": {"process_understanding": 7, "physics_chemistry": 7, "oem_based": 7, "equipment_based": 7},
-            "hard_fail_reasons": [],
-            "section_feedback": {},
-            "missing_elements": [],
-            "improvement_instructions": f"Critique agent timed out: {e}. Auto-approving to avoid infinite loop."
-        }
-        history = state.get("kb_history", [])
-        history.append({"candidate": candidate, "critique": critique, "avg_score": 7.0})
-        return {"kb_critique": critique, "kb_history": history}
-
+    response = llm.invoke([SystemMessage(content=critique_prompt)])
+    
     import re
-    resp_text = resp_text
+    resp_text = response.content
     match = re.search(r'\{.*\}', resp_text, re.DOTALL)
     if match:
         resp_text = match.group(0)
@@ -663,6 +405,7 @@ Be STRICT. If unsure -> REJECT. Weak outputs must NOT pass.
         pass
     
     return {"kb_critique": critique, "kb_history": history}
+
 
 def finalize_kb_node(state: AgentState, config: RunnableConfig) -> AgentState:
     """
@@ -774,41 +517,14 @@ def quality_analyst_node(state: AgentState) -> AgentState:
     except Exception:
         dataset_metadata = "Dataset dimensions could not be parsed."
     
-    system_prompt = f"""You are an expert Data Quality Analyst. Your job is to analyze the output of predefined data quality checks.
-    
-    DATASET OVERVIEW:
-    {dataset_metadata}
-    
-    The user has provided the following context about the data:
-    "{user_context}"
-    
-    You need to:
-    1. Review the JSON output of ALL the predefined functions (e.g. missing values, repeating values, outliers, min/max).
-    2. You also need to check if the values are realistic based on the user's context. Don't just highlight missing, repeated, negative values because that would be very surface level. Along with highlighting those, highlight insights about the data quality that are not easy to catch.
-    3. Reason about the physics and logic of the variables *based STRICTLY on the user's context*.
-        For example: If the user context says it's a Pulp and Fiber plant, use your knowledge of that domain to understand if certain values (like negative pressures or temperatures, or specific pH ranges) are realistic. TEMPERATURE CAN BE NEGATIVE, PRESSURE CANNOT BE NEGATIVE.
-    4. If the user context requests a specific check that is NOT covered by the predefined functions (e.g., a specific complex logical constraint), you MUST use the `generate_and_test_custom_function` tool to write a new python function to check for it.
-        CRITICAL RULES FOR GENERATION:
-        - Ensure the function name is GLOBALLY UNIQUE (e.g., append the column name to the function name `check_negative_pressure_blower_inlet`). If you generate the identical function name twice, the database will throw an integrity constraint error!
-        - If the tool execution returns an error like "Function name conflict" or "Database locked", do NOT display that technical error to the user in your output! Instead, internally generate a new unique function name and try again.
-        - DO NOT TRY MORE THAN ONCE per concept. If generation fails repeatedly, move on to avoid getting stuck in a loop.
-    5. The system has several advanced domain physics and statistical functions available (Group 2 and Group 3) that require specific column parameters to run. You MUST use the `execute_existing_function_with_params` tool to run them if they are relevant to the user context.
-        AVAILABLE ADVANCED FUNCTIONS:
-{advanced_funcs_desc}
-        If the function requires a timestamp column, you must provide it in the params dictionary like `{{"timestamp_col": "NameOfColumn"}}`.
-    6. Ensure your reasoning STRICTLY ADHERES to the following domain limits retrieved from our 4-part physical Knowledge Base (Process, Physics/Chemistry, Equipment, OEM):
-{knowledge}
-    7. CRITICAL FOLLOW-UP CHAT RULE: If the user asks a follow-up question requesting data rows (e.g. "show me the last 10 rows", "display the outliers"), YOU MUST NEVER output unexecuted Python code blocks! You MUST natively invoke the `generate_and_test_custom_function` tool to write a pandas script, let the Engine execute it, read the JSON output, and display the final values to the user in a Markdown table.
-    
-    If you use any tool, log the results as a specific data quality issue.
-    
-    Do not stop until you have considered all columns and checked potential logical constraints against the user's context.
-    When you are done, summarize all identified issues clearly in your final response.
-    
-    Here is the predefined function results summary:
-    {summary}
-    """
-    
+    system_prompt = get_analyst_system_prompt(
+        dataset_metadata=dataset_metadata,
+        user_context=user_context,
+        advanced_funcs_desc=advanced_funcs_desc,
+        knowledge=knowledge,
+        summary=summary,
+    )
+
     if not messages:
         messages = [SystemMessage(content=system_prompt), HumanMessage(content="Please analyze the predefined function results summary using the provided context. If a custom test is needed, generate and run it. List all identified data quality issues.")]
         
@@ -926,24 +642,12 @@ def generate_report_node(state: AgentState) -> AgentState:
     
     # Re-initialize the LLM for the final generation task
     llm = get_llm(timeout_seconds=180.0)
-    prompt = f"""Based on the following data quality analysis findings, write a clear, professional Data Quality Report.
-    The report should have sections for:
-    1. Executive Summary
-    2. Missing and Repeating Values
-       IMPORTANT: You MUST explicitly include the following column-wise percentages for ALL columns in the dataset:
-{missing_repeating_text}
-    3. Advanced Dataset Quality
-       Include these high-level dataset metrics:
-{dataset_summary}
-    4. Logical Inconsistencies and Invalid Values
-    5. Recommendations
-    
-    IMPORTANT: For section "4. Logical Inconsistencies and Invalid Values", you MUST present the findings as a Markdown table. The table should have exactly two columns: "Variable Name" and "Inconsistencies Found". Do not use a numbered list for this section.
-    
-    Analysis Findings:
-    {final_analysis}
-    """
-    
+    prompt = get_report_prompt(
+        missing_repeating_text=missing_repeating_text,
+        dataset_summary=dataset_summary,
+        final_analysis=final_analysis,
+    )
+
     try:
         response = llm.invoke([HumanMessage(content=prompt)])
         return {"report": response.content}

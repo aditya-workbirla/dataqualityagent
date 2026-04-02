@@ -260,10 +260,10 @@ if (typeof vis !== 'undefined') {{
     layout: {{
       hierarchical: {{
         enabled: true,
-        direction: "UD",
+        direction: "LR",
         sortMethod: "directed",
-        levelSeparation: 100,
-        nodeSpacing: 160,
+        levelSeparation: 200,
+        nodeSpacing: 100,
         treeSpacing: 200,
         blockShifting: true,
         edgeMinimization: true,
