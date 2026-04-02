@@ -1,0 +1,121 @@
+{
+  "$schema": "https://aka.ms/codetour-schema",
+  "title": "testing",
+  "steps": [
+    {
+      "file": "app.py",
+      "line": 1,
+      "description": "## Step 1: Welcome to the Front Door!\n\nThis `app.py` file builds the beautiful website you see on your screen. \n\nWe built this using **Streamlit**, which is simply a shortcut to turn messy Python code into a user-friendly webpage. This is where we import all the heavy machinery (like Pandas and LangGraph) to make the magic happen."
+    },
+    {
+      "file": "app.py",
+      "line": 16,
+      "description": "## Step 2: The Hidden Vault (`.env`)\n\nThis line silently loads a hidden file called `.env`. \n\nIt contains highly sensitive credit card or API keys (like `OPENAI_API_KEY`) that let the AI communicate with Microsoft Azure or ChatGPT. Without this, the AI has no brain!"
+    },
+    {
+      "file": "app.py",
+      "line": 26,
+      "description": "## Step 3: Putting on the Paint\n\nStreamlit websites look boring by default. Here, we inject a massive custom `style.css` file that permanently paints the entire website into a sleek, professional Dark Mode so it looks like a real enterprise application."
+    },
+    {
+      "file": "app.py",
+      "line": 65,
+      "description": "## Step 4: Long-Term Memory (The Checkpointer)\n\nIf you close your laptop, you don't want the AI to forget what you were talking about! Here, we spin up a persistent database connection to `app.db`. Every single thought the AI has is quietly saved to your hard drive so you can resume old chats days later."
+    },
+    {
+      "file": "app.py",
+      "line": 75,
+      "description": "## Step 5: The Safety Switch (API Ping)\n\nLarge corporate networks (like VPNs or Zscalers) often block AI API calls entirely. Instead of making you click \"Run\" and wait 5 minutes for a blank white error screen, this tiny function instantly pings Azure exactly when the website opens to make sure the network is clear before proceeding!"
+    },
+    {
+      "file": "app.py",
+      "line": 105,
+      "description": "## Step 6: Loading Old Conversations\n\nThis is the magical logic that builds the sidebar on the left side of the screen. It looks into the memory vault we created earlier (`app.db`) and prints out UUID threads, physically restoring your exact chat history to the screen when you click one."
+    },
+    {
+      "file": "app.py",
+      "line": 146,
+      "description": "## Step 7: Structuring the Rooms (Tabs)\n\nHere we split the interface into 5 distinct 'Rooms' or Tabs. `New Analysis` handles uploading, `Functions DB` shows our math scripts, `Knowledge Graph` visualizes anomalies, `Domain Knowledge` shows the AI's rulebook, and `Agent Logs` exposes its internal thoughts."
+    },
+    {
+      "file": "app.py",
+      "line": 152,
+      "description": "## Step 8: Dropping in the Dirty Data\n\nThis single line of code builds the massive drag-and-drop box! When you upload a broken Excel file, it stores it directly into a standard Python table (`pd.DataFrame`) so the AI can read thousands of rows perfectly."
+    },
+    {
+      "file": "app.py",
+      "line": 192,
+      "description": "## Step 9: The Launchpad Button\n\nHere we render the giant blue `Run Quality Analysis` button. Notice that if our Safety Switch (Step 5) detected that your VPN was disconnected, it natively 'grays out' this button so you can't click it until you fix your internet!"
+    },
+    {
+      "file": "app.py",
+      "line": 202,
+      "description": "## Step 10: Waking up the Graph Engine\n\nWhen you finally click 'Run', we boot up `build_data_quality_graph()`. This isn't just a basic chatbot; it's a massive robotic flowchart called LangGraph that forces multiple different AI personas to talk to each other to solve your problem."
+    },
+    {
+      "file": "app.py",
+      "line": 208,
+      "description": "## Step 11: The Spy Dashboard (Langfuse)\n\nWe connect a 'telemetry wire' named Langfuse right directly into the AI's brain. Now, every single word it types, every tool it runs, and every cent it spends is silently broadcasted to your cloud dashboard for management to track."
+    },
+    {
+      "file": "app.py",
+      "line": 220,
+      "description": "## Step 12: Real-Time Transparency\n\nInstead of just executing the flowchart and freezing your screen for 3 minutes, we use `.stream()`. This allows us to intercept the AI while it is actively 'thinking' and print exactly which node it is inside of live to the 'Agent Logs' tab for you to watch!"
+    },
+    {
+      "file": "agents/agent.py",
+      "line": 56,
+      "description": "## Step 13: Plugging into Microsoft (`get_llm`)\n\nWelcome to `agent.py`, the core engine block! This `get_llm()` script is the plug that physically dials out to Microsoft Azure (or OpenAI) to give the application actual intelligence. We put aggressive 120-second connection timeouts here so it doesn't hang forever."
+    },
+    {
+      "file": "agents/agent.py",
+      "line": 670,
+      "description": "## Step 14: The Master Flowchart\n\nThis section physically maps out the AI's brain. You can see how the Nodes (like `knowledge_agent` and `quality_analyst`) are connected together with conditional Edges, effectively forcing the AI to walk down hallways until it finds the exit."
+    },
+    {
+      "file": "agents/agent.py",
+      "line": 650,
+      "description": "## Step 15: The Traffic Cop (`route_to_start`)\n\nWhen an input comes into the flowchart, this traffic cop checks if the data has already been analyzed. If it's a brand new Excel sheet, it sends it to the Orchestrator. If you're just typing a follow-up question, it bypasses the heavy lifting and skips you straight to the end!"
+    },
+    {
+      "file": "agents/agent.py",
+      "line": 162,
+      "description": "## Step 16: The Researcher (Knowledge Agent)\n\nThis specific part of the AI acts like an expert engineer reading textbooks. It takes the columns from your Excel file and natively browses the internet (using DuckDuckGo) or reads massive standard operating manuals to discover the physical limits of your exact machines. It outputs a 4-chapter manual (Process, Physics, Equipment, OEM)."
+    },
+    {
+      "file": "agents/agent.py",
+      "line": 490,
+      "description": "## Step 17: The Boss (Critique Agent)\n\nAI can hallucinate or write lazy generic text! To prevent bad manuals, we built a microscopic second AI called the **Critique Agent**. Its entire job is to aggressively grade the Researcher AI on a scale of 1 to 10. If the manual is sloppy, it forces the Researcher to delete it and try again!"
+    },
+    {
+      "file": "data/knowledge_critique_log.md",
+      "line": 1,
+      "description": "## Step 18: The Argument Room\n\nWe never want the AI to be a 'black box'. Every single time the Researcher and the Boss argue and grade each other, we physically print their exact conversation into this file! You can open it anytime to see exactly how the AI reasoned through your dataset step-by-step."
+    },
+    {
+      "file": "agents/tools.py",
+      "line": 31,
+      "description": "## Step 19: The Calculator AI\n\nOnce the AI knows the physical rules of your machines, it needs to find the anomalies. Instead of guessing, the AI physically writes raw Python Code here, executes it against your data like a calculator, reads the output, and flags the exact cells where the errors are."
+    },
+    {
+      "file": "agents/tools.py",
+      "line": 70,
+      "description": "## Step 20: Saving Math for Later\n\nIf the AI successfully wrote a brand new math equation to find a bizarre anomaly in your data, this line instantly commits that new Python script into `app.db` under 'Group 4'. Now, it can instantly reuse that exact same math on completely different factories in the future without having to rewrite it!"
+    },
+    {
+      "file": "agents/agent.py",
+      "line": 550,
+      "description": "## Step 21: The Presenter (Quality Analyst)\n\nThis is the final node in the flowchart. This AI persona reads all the math calculations, reads the Physics rulebook, and translates the raw numbers back into plain English for you. It builds the massive executive summary you see in the app!"
+    },
+    {
+      "file": "app.py",
+      "line": 250,
+      "description": "## Step 22: The Follow-Up Chat UI\n\nWe don't just want a one-off report. We want to be able to talk to the data! Here, we loop through the `st.session_state[\"chat_history\"]` and literally draw speech bubbles on the screen so you can interrogate the AI exactly like ChatGPT."
+    },
+    {
+      "file": "app.py",
+      "line": 270,
+      "description": "## Step 23: Your Input Box\n\nAnd finally, this tiny `st.chat_input()` bar is where you type \"Why did the pump pressure spike?\" That text is tossed right back up to the top of Step 10, restarting the brain's flowchart loop. \n\n**And that's it! That is the full architectural skeleton of the entire agentic system!**"
+    }
+  ]
+}

@@ -837,9 +837,75 @@
   }
 
   .shimmer {
+  /* Tooltip */
+  .tooltip-wrap { position: relative; display: inline-block; }
+  .tooltip {
+    display: none;
+    position: absolute; bottom: calc(100% + 6px); left: 50%; transform: translateX(-50%);
+    background: #1a2530; border: 1px solid var(--border);
+    border-radius: 4px; padding: 6px 10px;
+    font-size: 10px; color: var(--text); white-space: nowrap;
+    z-index: 200;
+  }
+  .tooltip-wrap:hover .tooltip { display: block; }
+
+  /* Running animation */
+  @keyframes shimmer {
+    0% { background-position: -200% 0; }
+    100% { background-position: 200% 0; }
+  }
+
+  .shimmer {
     background: linear-gradient(90deg, var(--surface2) 25%, #1a2535 50%, var(--surface2) 75%);
     background-size: 200% 100%;
     animation: shimmer 1.5s infinite;
     border-radius: 4px;
   }
 
+  /* MARKDOWN STYLING FOR REPORTS (Streamlit compatible) */
+  .stMarkdown h1, .stMarkdown h2, .stMarkdown h3, .stMarkdown h4 {
+    font-family: var(--sans);
+    margin-top: 1.6em;
+    margin-bottom: 0.6em;
+    font-weight: 700; /* Bolder! */
+  }
+  
+  .stMarkdown h1 {
+    font-size: 28px !important;
+    color: var(--text-bright) !important;
+    padding-bottom: 8px;
+    border-bottom: 2px solid var(--border);
+    letter-spacing: -0.02em;
+  }
+  
+  .stMarkdown h2 {
+    font-size: 22px !important;
+    color: var(--accent) !important; /* Nice minimalistic blue pop */
+  }
+  
+  .stMarkdown h3 {
+    font-size: 18px !important;
+    color: #a3c2e0 !important; /* Clean pastel blue/grey minimalistic color */
+    letter-spacing: 0.03em;
+  }
+  
+  .stMarkdown h4 {
+    font-size: 15px !important;
+    color: var(--text-dim) !important;
+    font-style: normal;
+  }
+
+  /* Adjust paragraph spacing in the report */
+  .stMarkdown p {
+    font-size: 13px !important;
+    line-height: 1.8;
+    color: var(--text);
+  }
+  
+  /* Make inline code blocks pop slightly */
+  .stMarkdown code {
+    color: var(--accent3) !important;
+    background: rgba(245,197,66,0.1) !important;
+    padding: 2px 4px;
+    border-radius: 3px;
+  }

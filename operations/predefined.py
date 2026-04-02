@@ -18,13 +18,13 @@ def run_all_verified_functions(df: pd.DataFrame) -> Dict[str, Any]:
     try:
         with sqlite3.connect(db_path, timeout=10.0) as conn:
             cursor = conn.cursor()
-            # Only fetch GROUP 1 functions that have been approved by the team
-            cursor.execute("SELECT function_name, function_code FROM data_quality_functions WHERE approved_by_team = 1 AND function_group = 1")
+            # Fetch ALL functions that have been approved by the team (Groups 1, 2, and 3)
+            cursor.execute("SELECT function_name, function_code FROM data_quality_functions WHERE approved_by_team = 1 AND function_group IN (1, 2, 3)")
             approved_functions = cursor.fetchall()
     except Exception as e:
         return {"error": f"Failed to connect to database: {e}"}
         
-    # Execute Group 1 functions on the full dataset
+    # Execute functions on the full dataset
     for func_name, func_code in approved_functions:
         try:
             local_scope = {}
@@ -33,7 +33,7 @@ def run_all_verified_functions(df: pd.DataFrame) -> Dict[str, Any]:
             
             if func_name in local_scope:
                 func = local_scope[func_name]
-                # All Group 1 functions take df and optional params
+                # Functions take df and optional params
                 res = func(df)
                 
                 # Check if it passed

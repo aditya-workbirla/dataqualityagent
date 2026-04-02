@@ -617,35 +617,26 @@ def generate_report_node(state: AgentState) -> AgentState:
     and synthesizes them into a polished markdown report for the user.
     """
     messages = state["messages"]
+    import json
     summary = state.get("function_results_summary", {})
+    function_outputs = json.dumps(summary, indent=2)
     
-    # Grab the final analysis from the LLM
-    final_analysis = messages[-1].content
-    
-    # Build text for missing values and high-level column stats
-    missing_repeating_text = "       (Aggregated from automated Group 1 checks)\n"
-    
-    dataset_checks = summary.get("dataset_checks", {})
-    null_results = dataset_checks.get("check_null_values", {}).get("column_results", {})
-    
-    # We'll use the columns found in null_results to list metrics for all columns
-    for col, stats in null_results.items():
-        null_pct = stats.get("null_pct", "N/A")
-        missing_repeating_text += f"       - **{col}**: {null_pct}% null/missing\n"
+    try:
+        raw_data = json.loads(state.get("df_json", "[]"))
+        cols = list(raw_data[0].keys()) if len(raw_data) > 0 else []
+        col_list = "\\n".join([f"- {c}" for c in cols])
+    except Exception:
+        col_list = "Could not extract columns."
         
-    # Extract advanced dataset checks summary (Group 1 overview)
-    dataset_summary = ""
-    for check_name, check_result in dataset_checks.items():
-        ds_msg = check_result.get("summary", "")
-        if ds_msg:
-            dataset_summary += f"       - **{check_name}**: {ds_msg}\n"
+    knowledge_base = state.get("retrieved_knowledge", "No knowledge base retrieved.")
+    final_analysis = messages[-1].content if messages else ""
     
     # Re-initialize the LLM for the final generation task
     llm = get_llm(timeout_seconds=180.0)
     prompt = get_report_prompt(
-        missing_repeating_text=missing_repeating_text,
-        dataset_summary=dataset_summary,
-        final_analysis=final_analysis,
+        col_list=col_list,
+        function_outputs=function_outputs,
+        knowledge_base=knowledge_base,
     )
 
     try:
