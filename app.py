@@ -97,7 +97,7 @@ def _check_llm_endpoint() -> tuple[bool, str, float]:
     try:
         r = httpx.post(
             url,
-            json={"messages": [{"role": "user", "content": "ping"}], "max_completion_tokens": 1},
+            json={"messages": [{"role": "user", "content": "Say OK"}], "max_completion_tokens": 10},
             headers=headers,
             timeout=httpx.Timeout(12.0, connect=5.0),
             verify=False,
@@ -137,6 +137,11 @@ with st.sidebar:
             f"- Check `AZURE_OPENAI_API_VERSION` is supported by your deployment\n"
             f"- If endpoint is a private IP (`10.x.x.x`), ensure subnet `10.10.11.x` is whitelisted in Azure Networking"
         )
+    if st.button("🔄 Re-check endpoint", use_container_width=True):
+        # Clear cached result so the check runs again on the next rerun
+        for k in ("llm_endpoint_ok", "llm_endpoint_reason"):
+            st.session_state.pop(k, None)
+        st.rerun()
     st.divider()
 
 # Initialize session state variables if they don't exist
@@ -232,7 +237,7 @@ with st.sidebar:
                 
                 st.rerun()
 
-tab1, tab2, tab3, tab4 = st.tabs(["New Analysis", "Functions DB", "Knowledge Graph", "Domain Knowledge Base"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["New Analysis", "Functions DB", "Knowledge Graph", "Domain Knowledge Base", "Agent Workflow"])
 
 with tab1:
     st.markdown(ui_components.get_header_html(), unsafe_allow_html=True)
@@ -508,3 +513,8 @@ with tab4:
             )
     except Exception as e:
         st.error(f"Could not load knowledge database: {e}")
+
+with tab5:
+    st.header("Agent Workflow Diagram")
+    st.markdown("Interactive graph of the LangGraph pipeline. **Drag nodes**, scroll to zoom, hover for descriptions.")
+    components.html(ui_components.get_workflow_graph_html(), height=620)

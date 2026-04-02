@@ -161,3 +161,133 @@ def get_issue_html(title, body, level="warning"):
       </div>
     </div>
     """
+
+def get_workflow_graph_html() -> str:
+    """
+    Returns a self-contained HTML page that renders the LangGraph agent pipeline
+    as an interactive vis.js network diagram.
+    Nodes are colour-coded by role; edges show conditional routing labels.
+    """
+    nodes_json = """[
+      { "id": "START",                   "label": "START",                    "group": "io",        "title": "Entry point — routes to collect_function_results (new run) or check_existing_kb (follow-up chat)" },
+      { "id": "collect_function_results","label": "⚙️ Collect\\nFunction Results","group": "data",  "title": "Runs all approved Group 1/2/3 functions from SQLite against the uploaded dataset. Pure Python — no LLM call." },
+      { "id": "check_existing_kb",       "label": "🗄️ Check\\nExisting KB",    "group": "data",      "title": "Single SQLite SELECT — checks if a domain knowledge base already exists for this thread_id. Takes < 5 ms." },
+      { "id": "knowledge_agent",         "label": "🔍 Knowledge\\nAgent",       "group": "llm",       "title": "LLM node (up to 5 turns). Searches DuckDuckGo + GPT-4o to build 4-section KB: Process, Physics/Chemistry, Equipment, OEM. ~90 s." },
+      { "id": "critique_agent",          "label": "🧐 Critique\\nAgent",        "group": "llm",       "title": "LLM node. Scores each KB section 0–10. Approves if all ≥ 7 and 2 sections ≥ 8. Rejects otherwise — triggers retry." },
+      { "id": "finalize_kb",             "label": "💾 Finalise\\nKB",           "group": "data",      "title": "Saves the approved (or best-scoring) KB candidate to SQLite domain_knowledge table. Then reads it back into state." },
+      { "id": "quality_analyst",         "label": "🧠 Quality\\nAnalyst",       "group": "llm",       "title": "Core reasoning node. Reviews function results, applies domain KB, calls tools as needed. Loops until no more tool calls." },
+      { "id": "tool_execution",          "label": "🔧 Tool\\nExecution",        "group": "tool",      "title": "Executes the tool chosen by the analyst — either generate_and_test_custom_function or execute_existing_function_with_params." },
+      { "id": "generate_report",         "label": "📋 Generate\\nReport",       "group": "llm",       "title": "Final LLM call. Takes all analyst findings and writes the structured markdown Data Quality Report." },
+      { "id": "END",                     "label": "END",                      "group": "io",        "title": "Terminal node. Reached after report is saved (new run) or after analyst answers a follow-up chat." }
+    ]"""
+
+    edges_json = """[
+      { "from": "START",                    "to": "collect_function_results", "label": "new run",      "dashes": true,  "color": {"color":"#4a9eff"} },
+      { "from": "START",                    "to": "check_existing_kb",        "label": "follow-up",    "dashes": true,  "color": {"color":"#4a9eff"} },
+      { "from": "collect_function_results", "to": "check_existing_kb",        "label": "",             "dashes": false, "color": {"color":"#aaaaaa"} },
+      { "from": "check_existing_kb",        "to": "knowledge_agent",          "label": "no KB found",  "dashes": true,  "color": {"color":"#f5a623"} },
+      { "from": "check_existing_kb",        "to": "quality_analyst",          "label": "KB exists",    "dashes": true,  "color": {"color":"#7ed321"} },
+      { "from": "knowledge_agent",          "to": "critique_agent",           "label": "",             "dashes": false, "color": {"color":"#aaaaaa"} },
+      { "from": "critique_agent",           "to": "knowledge_agent",          "label": "rejected\\n(retry ≤3)",  "dashes": true,  "color": {"color":"#e74c3c"} },
+      { "from": "critique_agent",           "to": "finalize_kb",              "label": "approved",     "dashes": true,  "color": {"color":"#7ed321"} },
+      { "from": "critique_agent",           "to": "quality_analyst",          "label": "bypass\\n(failsafe)", "dashes": true, "color": {"color":"#9b59b6"} },
+      { "from": "finalize_kb",              "to": "quality_analyst",          "label": "",             "dashes": false, "color": {"color":"#aaaaaa"} },
+      { "from": "quality_analyst",          "to": "tool_execution",           "label": "tool call",    "dashes": true,  "color": {"color":"#f5a623"} },
+      { "from": "quality_analyst",          "to": "generate_report",          "label": "analysis done","dashes": true,  "color": {"color":"#7ed321"} },
+      { "from": "quality_analyst",          "to": "END",                      "label": "chat reply",   "dashes": true,  "color": {"color":"#9b59b6"} },
+      { "from": "tool_execution",           "to": "quality_analyst",          "label": "result →\\nback to analyst", "dashes": false, "color": {"color":"#f5a623"} },
+      { "from": "generate_report",          "to": "END",                      "label": "",             "dashes": false, "color": {"color":"#aaaaaa"} }
+    ]"""
+
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ background: #0e1117; font-family: 'Inter', sans-serif; color: #e0e0e0; }}
+  #graph {{ width: 100%; height: 560px; border: 1px solid #2a2d35; border-radius: 8px; background: #161a24; }}
+  #legend {{ display: flex; gap: 16px; flex-wrap: wrap; padding: 10px 4px 4px; }}
+  .leg {{ display: flex; align-items: center; gap: 6px; font-size: 12px; color: #aaa; }}
+  .dot {{ width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; }}
+</style>
+</head>
+<body>
+<div id="legend">
+  <div class="leg"><div class="dot" style="background:#4a9eff"></div> I/O (START / END)</div>
+  <div class="leg"><div class="dot" style="background:#f5a623"></div> LLM node</div>
+  <div class="leg"><div class="dot" style="background:#2ecc71"></div> Data / DB node</div>
+  <div class="leg"><div class="dot" style="background:#9b59b6"></div> Tool execution</div>
+  <div class="leg" style="margin-left:auto; font-size:11px; color:#555">Drag to rearrange · Scroll to zoom · Hover for details</div>
+</div>
+<div id="graph"></div>
+
+<script>
+// Inline vis-network from CDN fallback or local
+</script>
+<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"
+        onerror="document.getElementById('graph').innerHTML='<p style=color:#e74c3c;padding:20px>vis.js failed to load (no internet). Diagram unavailable.</p>'">
+</script>
+<script>
+if (typeof vis !== 'undefined') {{
+  var nodes = new vis.DataSet({nodes_json});
+  var edges = new vis.DataSet({edges_json});
+
+  var groups = {{
+    io:   {{ color: {{ background:"#1a2a4a", border:"#4a9eff", highlight:{{background:"#1e3560",border:"#7ab8ff"}} }}, font:{{ color:"#4a9eff", size:13, bold:true }} }},
+    llm:  {{ color: {{ background:"#2a1e0a", border:"#f5a623", highlight:{{background:"#3a2a0e",border:"#ffbe57"}} }}, font:{{ color:"#f5d080", size:12 }} }},
+    data: {{ color: {{ background:"#0a2a15", border:"#2ecc71", highlight:{{background:"#0e3a1e",border:"#5ee89a"}} }}, font:{{ color:"#a8f0c0", size:12 }} }},
+    tool: {{ color: {{ background:"#1e0a2a", border:"#9b59b6", highlight:{{background:"#2a0e3a",border:"#c07fd4"}} }}, font:{{ color:"#d4a0f0", size:12 }} }},
+  }};
+
+  var options = {{
+    groups: groups,
+    nodes: {{
+      shape: "box",
+      borderWidth: 2,
+      borderWidthSelected: 3,
+      margin: {{ top:10, right:14, bottom:10, left:14 }},
+      shadow: {{ enabled:true, size:8, x:2, y:2, color:"rgba(0,0,0,0.5)" }},
+      font: {{ size:12, face:"monospace" }},
+    }},
+    edges: {{
+      arrows: {{ to: {{ enabled:true, scaleFactor:0.7 }} }},
+      smooth: {{ type:"curvedCW", roundness:0.15 }},
+      font: {{ size:10, color:"#888", align:"middle", background:"#161a24", strokeWidth:0 }},
+      width: 1.5,
+      selectionWidth: 3,
+    }},
+    layout: {{
+      hierarchical: {{
+        enabled: true,
+        direction: "UD",
+        sortMethod: "directed",
+        levelSeparation: 100,
+        nodeSpacing: 160,
+        treeSpacing: 200,
+        blockShifting: true,
+        edgeMinimization: true,
+        parentCentralization: true,
+      }}
+    }},
+    interaction: {{
+      hover: true,
+      tooltipDelay: 150,
+      zoomView: true,
+      dragView: true,
+      navigationButtons: false,
+    }},
+    physics: {{ enabled: false }},
+  }};
+
+  var container = document.getElementById("graph");
+  var network = new vis.Network(container, {{ nodes:nodes, edges:edges }}, options);
+
+  // Re-fit on double-click of background
+  network.on("doubleClick", function(p) {{
+    if (p.nodes.length === 0) network.fit({{ animation: {{ duration:400, easingFunction:"easeInOutQuad" }} }});
+  }});
+}}
+</script>
+</body>
+</html>"""
