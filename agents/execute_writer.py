@@ -125,13 +125,18 @@ def _render_execute_file() -> str:
     ]
 
     # ── Dataset loader ───────────────────────────────────────────────────────
+    # Use an absolute path anchored to the project root (parent of agents/).
+    # The path stored in _DATASET_CSV_PATH is relative to the project root.
     load_path = _DATASET_CSV_PATH or "data/sample_faulty_data.csv"
+    # Normalise to forward slashes for cross-platform readability
+    load_path_display = load_path.replace("\\", "/")
     lines += [
         "# ─────────────────────────────────────────────────────────────────",
         "# DATASET LOADING",
-        "# Replace the path below with the actual path to your dataset.",
         "# ─────────────────────────────────────────────────────────────────",
-        f'DATASET_PATH = os.path.join(os.path.dirname(__file__), "{load_path}")',
+        "# _PROJECT_ROOT is the directory containing execute.py",
+        "_PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))",
+        f'DATASET_PATH = os.path.join(_PROJECT_ROOT, "{load_path_display}")',
         "",
         "def load_dataset(path: str) -> pd.DataFrame:",
         '    """Load dataset from CSV or Excel, auto-detecting format."""',
@@ -258,21 +263,34 @@ def _write_file() -> None:
 
 def set_dataset_path(path: str) -> None:
     """
-    Record the uploaded dataset filename so execute.py loads the right file.
-    Call this from app.py immediately after the file is uploaded.
+    Record the dataset path (relative to project root) so execute.py loads
+    the right file.  Accepts either:
+      - A bare filename  "VIL_P2_agentdata.xlsx"  → stored as "data/<filename>"
+      - A relative path  "data/VIL_P2_agentdata.xlsx"  → stored as-is
+      - An absolute path  "/srv/.../data/VIL_P2_agentdata.xlsx"  → kept as-is
+
+    Call this from app.py immediately after the file is uploaded AND after
+    saving the file bytes to the data/ directory.
     """
     global _DATASET_CSV_PATH
+    # Normalise bare filenames to data/ subdirectory
+    if path and not os.sep in path and "/" not in path:
+        path = os.path.join("data", path)
     _DATASET_CSV_PATH = path
 
 
 def reset_execute_file(dataset_path: str = "", df=None) -> None:
     """
     Call this at the start of every new analysis run.
-    Clears the in-memory list and rewrites execute.py from scratch.
+    Clears the in-memory function list and rewrites execute.py from scratch.
+    If dataset_path is empty, the previously set path (via set_dataset_path)
+    is preserved so the file header stays correct.
     """
     global _SESSION_ENTRIES, _DATASET_CSV_PATH
     _SESSION_ENTRIES = []
-    _DATASET_CSV_PATH = dataset_path
+    # Only overwrite the path when a non-empty value is explicitly provided
+    if dataset_path:
+        _DATASET_CSV_PATH = dataset_path
     if df is not None:
         _capture_df_meta(df)
     _write_file()

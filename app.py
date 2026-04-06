@@ -165,6 +165,26 @@ if "checkpointer" not in st.session_state:
     st.session_state["checkpointer"] = saver
 if "thread_id" not in st.session_state:
     st.session_state["thread_id"] = str(uuid.uuid4())
+if "uploaded_dataset_path" not in st.session_state:
+    st.session_state["uploaded_dataset_path"] = ""
+
+# ── Re-hydrate execute_writer dataset path and _CURRENT_DF on every page load ──
+# Streamlit reruns the entire script on each interaction. Module-level globals
+# in execute_writer (_DATASET_CSV_PATH) and tools (_CURRENT_DF) survive as long
+# as the Python process is alive, but we re-sync them from session_state to be safe.
+_saved_path = st.session_state.get("uploaded_dataset_path", "")
+if _saved_path:
+    try:
+        from agents.execute_writer import set_dataset_path as _sdp
+        _sdp(_saved_path)
+    except Exception:
+        pass
+if st.session_state.get("agent_state"):
+    try:
+        from agents.agent import _rehydrate_df_for_tools
+        _rehydrate_df_for_tools(st.session_state["agent_state"])
+    except Exception:
+        pass
 
 def convert_df_to_csv(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
@@ -312,12 +332,26 @@ with tab1:
             else:
                 df = pd.read_excel(uploaded_file)
 
-            # Tell execute_writer the real filename so execute.py loads the right file
+            # Save the uploaded file to data/ so execute.py can load it by path
+            _saved_dataset_path = os.path.join("data", uploaded_file.name)
+            try:
+                os.makedirs("data", exist_ok=True)
+                uploaded_file.seek(0)
+                with open(_saved_dataset_path, "wb") as _fout:
+                    _fout.write(uploaded_file.read())
+            except Exception as _save_err:
+                print(f"⚠️  Could not save dataset to data/: {_save_err}")
+                _saved_dataset_path = uploaded_file.name  # fallback
+
+            # Tell execute_writer the real relative path
             try:
                 from agents.execute_writer import set_dataset_path
-                set_dataset_path(uploaded_file.name)
+                set_dataset_path(_saved_dataset_path)
             except Exception:
                 pass
+
+            # Also store in session_state so it survives reruns
+            st.session_state["uploaded_dataset_path"] = _saved_dataset_path
 
             st.markdown(f"""
             <div class="file-preview visible" style="margin-top:-10px; margin-bottom: 20px;">

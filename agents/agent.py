@@ -171,6 +171,32 @@ def sanitize_for_msgpack(obj):
     else:
         return obj
 
+
+def _rehydrate_df_for_tools(state: AgentState) -> None:
+    """
+    Ensures _CURRENT_DF is populated from state["df_json"] so that tools
+    (generate_and_test_custom_function, execute_existing_function_with_params)
+    can access the dataframe even during follow-up chat turns where
+    collect_function_results_node is NOT re-executed.
+
+    Also re-hydrates execute_writer's df metadata so execute.py stays accurate.
+    """
+    import io
+    df_json = state.get("df_json", "")
+    if not df_json:
+        return
+    try:
+        df = pd.read_json(io.StringIO(df_json))
+        set_current_df(df)
+        # Keep execute_writer in sync so it knows column names / shape
+        try:
+            from agents.execute_writer import _capture_df_meta
+            _capture_df_meta(df)
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"⚠️  _rehydrate_df_for_tools failed: {e}")
+
 def collect_function_results_node(state: AgentState) -> AgentState:
     """
     Runs all predefined statistical and quality checks on the raw dataset locally.
@@ -584,6 +610,11 @@ def quality_analyst_node(state: AgentState) -> AgentState:
     The core AI node. It reviews the JSON summary of predefined checks, applying 
     the user's specific context/domain prompt to identify anomalies.
     """
+    # ── Always ensure tools have access to the live dataframe ─────────────
+    # collect_function_results_node is skipped on follow-up turns, so we must
+    # re-hydrate _CURRENT_DF from the serialised df_json in state.
+    _rehydrate_df_for_tools(state)
+
     summary = state["function_results_summary"]
     user_context = state.get("user_context_prompt", "No specific context provided.")
     messages = state.get("messages", [])
@@ -775,6 +806,9 @@ def tool_execution_node(state: AgentState) -> AgentState:
     """
     Node 3: Execute tools requested by the LLM.
     """
+    # Safety net: rehydrate df in case this worker process lost it
+    _rehydrate_df_for_tools(state)
+
     messages = state["messages"]
     last_message = messages[-1]
     
