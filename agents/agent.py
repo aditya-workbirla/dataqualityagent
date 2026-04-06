@@ -18,6 +18,12 @@ from prompts.knowledge_agent_prompts import (
 from prompts.analyst_prompts import get_analyst_system_prompt
 from prompts.report_prompts import get_report_prompt
 from prompts.planner_prompts import get_planner_prompt
+from agents.rag_kb import (
+    build_kb_embeddings,
+    build_kb_embeddings_from_db,
+    embeddings_exist,
+    retrieve_relevant_chunks,
+)
 
 # Define the LangGraph State type
 # This state dictionary is passed between every node in the graph.
@@ -33,6 +39,7 @@ class AgentState(TypedDict):
     
     # Follow-up chat planner
     chat_plan: str          # Structured execution plan produced by the planner agent
+    rag_chunks: str         # Top-k retrieved KB chunks for the current follow-up query
 
     # Multi-Agent KB Validation Loop
     kb_candidate: List[Dict[str, Any]]
@@ -465,7 +472,26 @@ def finalize_kb_node(state: AgentState, config: RunnableConfig) -> AgentState:
             conn.commit()
     except Exception as e:
         print(f"Failed to finalize knowledge DB: {e}")
-        
+
+    # ── Build RAG embeddings for this thread ──────────────────────────────
+    # Normalise final_candidate to use the cleaned category names
+    kb_for_rag = []
+    for rule in final_candidate:
+        cat_lower = rule.get("category", "").lower()
+        clean_cat = "Process"
+        if "phys" in cat_lower or "chem" in cat_lower: clean_cat = "Physics/Chemistry"
+        elif "equip" in cat_lower: clean_cat = "Equipment"
+        elif "oem" in cat_lower: clean_cat = "OEM"
+        kb_for_rag.append({
+            "category": clean_cat,
+            "topic": rule.get("topic", ""),
+            "knowledge_text": rule.get("knowledge_text", ""),
+        })
+    try:
+        build_kb_embeddings(thread_id, kb_for_rag)
+    except Exception as e:
+        print(f"⚠️  RAG embedding step failed (non-fatal): {e}")
+
     # Read it back instantly to hydrate the analyst retrieval slot
     retrieved_text = ""
     try:
@@ -477,8 +503,62 @@ def finalize_kb_node(state: AgentState, config: RunnableConfig) -> AgentState:
                 retrieved_text += f"- [{r[0]}] {r[1]}: {r[2]}\\n"
     except Exception as e:
         retrieved_text = f"Could not load finalized knowledge base: {e}"
-        
+
     return {"retrieved_knowledge": retrieved_text}
+
+
+# ==============================================================================
+#                 NODE 1.7: RAG RETRIEVAL
+# ==============================================================================
+def rag_retrieval_node(state: AgentState, config: RunnableConfig) -> AgentState:
+    """
+    Retrieves the most relevant KB chunks for the current follow-up question
+    using vector similarity search.
+
+    - Runs only during follow-up turns (state["report"] exists).
+    - If embeddings haven't been built yet for this thread (e.g. session resume),
+      triggers a build from the domain_knowledge table.
+    - Stores the top-k chunk texts in state["rag_chunks"] for the analyst.
+    """
+    # Only run during follow-up turns
+    if not state.get("report"):
+        return {"rag_chunks": ""}
+
+    thread_id = config.get("configurable", {}).get("thread_id", "global")
+
+    # If embeddings don't exist yet (session resume), build them now
+    if not embeddings_exist(thread_id):
+        try:
+            n = build_kb_embeddings_from_db(thread_id)
+            if n == 0:
+                return {"rag_chunks": ""}
+        except Exception as e:
+            print(f"⚠️  RAG build on resume failed: {e}")
+            return {"rag_chunks": ""}
+
+    # Find the latest user question
+    messages = state.get("messages", [])
+    query = ""
+    for m in reversed(messages):
+        if isinstance(m, HumanMessage):
+            query = m.content
+            break
+
+    if not query:
+        return {"rag_chunks": ""}
+
+    # Also incorporate the planner's plan as additional query context
+    plan = state.get("chat_plan", "")
+    if plan:
+        query = f"{query}\n\nExecution plan context: {plan[:500]}"
+
+    try:
+        chunks_text = retrieve_relevant_chunks(query, thread_id, top_k=6)
+    except Exception as e:
+        print(f"⚠️  RAG retrieval failed: {e}")
+        chunks_text = ""
+
+    return {"rag_chunks": chunks_text}
 
 
 # ==============================================================================
@@ -511,6 +591,16 @@ def quality_analyst_node(state: AgentState) -> AgentState:
         advanced_funcs_desc = f"        - (Could not load from DB: {e})"
         
     knowledge = state.get("retrieved_knowledge", "No domain knowledge retrieved.")
+    # For follow-up turns use RAG-retrieved chunks (more focused, higher accuracy).
+    # For the initial analysis run, fall back to the full KB.
+    rag_chunks = state.get("rag_chunks", "")
+    if rag_chunks:
+        knowledge = (
+            "## Relevant Knowledge Base Sections (retrieved via RAG)\n\n"
+            + rag_chunks
+            + "\n\n---\n*(Only the most relevant sections are shown above. "
+            "Full KB is available in the Domain Knowledge Base tab.)*"
+        )
     
     import json
     try:
@@ -532,21 +622,33 @@ def quality_analyst_node(state: AgentState) -> AgentState:
     if not messages:
         messages = [SystemMessage(content=system_prompt), HumanMessage(content="Please analyze the predefined function results summary using the provided context. If a custom test is needed, generate and run it. List all identified data quality issues.")]
     else:
-        # Follow-up chat turn: inject the planner's execution plan as a system note
-        # so the analyst knows exactly what steps to execute.
-        chat_plan = state.get("chat_plan", "")
+        # Follow-up chat turn: inject both the planner's execution plan AND the
+        # RAG-retrieved KB chunks as a single system context block.
+        chat_plan  = state.get("chat_plan", "")
+        rag_chunks = state.get("rag_chunks", "")
+
+        injection_parts = []
         if chat_plan:
-            plan_injection = SystemMessage(content=(
-                f"## 📋 Execution Plan from Planner Agent\n\n"
-                f"The Planner Agent has analysed the user's question and produced the following plan. "
-                f"You MUST follow this plan step by step to answer the question.\n\n"
-                f"{chat_plan}"
-            ))
-            # Insert plan injection right before the last HumanMessage
+            injection_parts.append(
+                "## 📋 Execution Plan (from Planner Agent)\n\n"
+                "You MUST follow this plan step by step to answer the question.\n\n"
+                + chat_plan
+            )
+        if rag_chunks:
+            injection_parts.append(
+                "## 📚 Retrieved Domain Knowledge (RAG — most relevant sections)\n\n"
+                "Use these sections as your authoritative reference for domain reasoning. "
+                "Do NOT contradict them.\n\n"
+                + rag_chunks
+            )
+
+        if injection_parts:
+            injection_msg = SystemMessage(content="\n\n---\n\n".join(injection_parts))
             messages = list(messages)
+            # Insert right before the last HumanMessage
             for i in range(len(messages) - 1, -1, -1):
                 if isinstance(messages[i], HumanMessage):
-                    messages.insert(i, plan_injection)
+                    messages.insert(i, injection_msg)
                     break
         
     cleaned_messages = format_messages(messages)
@@ -708,7 +810,18 @@ def chat_planner_node(state: AgentState) -> AgentState:
         pass
 
     user_context = state.get("user_context_prompt", "No context provided.")
-    knowledge_base = state.get("retrieved_knowledge", "No knowledge base loaded.")
+
+    # For the planner we pass a short KB summary (not the full text) —
+    # the full retrieval happens in rag_retrieval_node which runs AFTER the planner.
+    # We give the planner enough context to reason about what to look up.
+    retrieved_knowledge = state.get("retrieved_knowledge", "")
+    kb_summary_lines = []
+    for line in retrieved_knowledge.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("- [") and "]" in stripped:
+            # Extract just the "[Category] Topic:" part (first 120 chars)
+            kb_summary_lines.append(stripped[:120])
+    knowledge_summary = "\n".join(kb_summary_lines[:30]) if kb_summary_lines else "Knowledge base not yet loaded."
 
     # Fetch ALL functions from DB (all groups) for the planner to reason about
     db_path = "database/app.db"
@@ -743,7 +856,7 @@ def chat_planner_node(state: AgentState) -> AgentState:
         dataset_metadata=dataset_metadata,
         user_context=user_context,
         available_functions=available_functions,
-        knowledge_base=knowledge_base,
+        knowledge_base=knowledge_summary,
     )
 
     try:
@@ -821,6 +934,7 @@ def build_data_quality_graph(checkpointer=None) -> StateGraph:
     workflow.add_node("critique_agent", critique_agent_node)
     workflow.add_node("finalize_kb", finalize_kb_node)
     workflow.add_node("chat_planner", chat_planner_node)
+    workflow.add_node("rag_retrieval", rag_retrieval_node)
     workflow.add_node("quality_analyst", quality_analyst_node)
     workflow.add_node("tool_execution", tool_execution_node)
     workflow.add_node("generate_report", generate_report_node)
@@ -836,9 +950,9 @@ def build_data_quality_graph(checkpointer=None) -> StateGraph:
     )
     workflow.add_edge("collect_function_results", "check_existing_kb")
     
-    # After the planner finishes, hand off directly to the quality analyst
-    # (KB already exists in state from the first analysis run)
-    workflow.add_edge("chat_planner", "quality_analyst")
+    # After the planner finishes → RAG retrieval → quality analyst
+    workflow.add_edge("chat_planner", "rag_retrieval")
+    workflow.add_edge("rag_retrieval", "quality_analyst")
 
     workflow.add_conditional_edges(
         "check_existing_kb",

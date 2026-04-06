@@ -345,6 +345,7 @@ with tab1:
         "critique_agent":           ("🧐", "Critiquing & scoring the knowledge base…"),
         "finalize_kb":              ("💾", "Finalising & saving the knowledge base…"),
         "chat_planner":             ("📋", "Planner agent is mapping out execution steps…"),
+        "rag_retrieval":            ("🔎", "Retrieving relevant knowledge base sections (RAG)…"),
         "quality_analyst":          ("🧠", "Reasoning agent is analysing data quality…"),
         "tool_execution":           ("🔧", "Executing custom data quality function…"),
         "generate_report":          ("📋", "Generating the final quality report…"),
@@ -484,6 +485,20 @@ with tab1:
                         if exec_log.get("plan"):
                             st.markdown("### 🗺️ Planner's Execution Plan")
                             st.markdown(exec_log["plan"])
+                        # ── RAG chunks retrieved ──────────────────────────────
+                        if exec_log.get("rag_chunks"):
+                            st.divider()
+                            st.markdown("### 🔎 Knowledge Base Sections Retrieved (RAG)")
+                            # Show each chunk as a compact expander
+                            raw = exec_log["rag_chunks"]
+                            chunk_blocks = [b.strip() for b in raw.split("--- Chunk ") if b.strip()]
+                            for block in chunk_blocks:
+                                # First line is "N: [Category] Section heading ---"
+                                first_nl = block.find("\n")
+                                header = block[:first_nl].rstrip(" -") if first_nl != -1 else block
+                                body   = block[first_nl:].strip() if first_nl != -1 else ""
+                                with st.expander(f"📄 {header}", expanded=False):
+                                    st.markdown(body)
                         # ── Functions called ──────────────────────────────────
                         existing = exec_log.get("existing_functions", [])
                         new_funcs = exec_log.get("new_functions", [])
@@ -515,6 +530,7 @@ with tab1:
 
                 follow_state  = None
                 planner_plan  = ""
+                rag_chunks_text = ""
                 existing_fns  = []   # {"name": str, "params": dict}
                 new_fns       = []   # {"name": str, "description": str}
 
@@ -525,6 +541,13 @@ with tab1:
                         # ── Planner: capture plan text ────────────────────────
                         if node_name == "chat_planner":
                             planner_plan = node_output.get("chat_plan", "")
+
+                        # ── RAG: show how many chunks retrieved ───────────────
+                        if node_name == "rag_retrieval":
+                            rag_chunks_text = node_output.get("rag_chunks", "")
+                            n_chunks = rag_chunks_text.count("--- Chunk ")
+                            if n_chunks:
+                                label = f"🔎 Retrieved {n_chunks} relevant KB sections via RAG…"
 
                         # ── Tool execution: track which functions ran ─────────
                         if node_name == "tool_execution":
@@ -541,7 +564,6 @@ with tab1:
                                     res = {}
                                 if raw_name == "generate_and_test_custom_function":
                                     fn_name = res.get("function_name", "unknown")
-                                    # Recover description from the AI message tool_calls before this
                                     new_fns.append({"name": fn_name, "description": res.get("database_status", "")})
                                 elif raw_name == "execute_existing_function_with_params":
                                     existing_fns.append({
@@ -567,11 +589,11 @@ with tab1:
                 st.session_state["chat_history"].append({"role": "assistant", "content": ai_response})
 
                 # ── Persist execution log keyed to this assistant turn ────────
-                # The assistant turn index = len(chat_history) - 1 (just appended)
                 turn_idx = len(st.session_state["chat_history"]) - 1
-                if planner_plan or existing_fns or new_fns:
+                if planner_plan or existing_fns or new_fns or rag_chunks_text:
                     st.session_state["chat_execution_logs"][turn_idx] = {
                         "plan":               planner_plan,
+                        "rag_chunks":         rag_chunks_text,
                         "existing_functions": existing_fns,
                         "new_functions":      new_fns,
                     }
