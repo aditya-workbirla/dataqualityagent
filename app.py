@@ -311,6 +311,14 @@ with tab1:
                 df = pd.read_csv(uploaded_file)
             else:
                 df = pd.read_excel(uploaded_file)
+
+            # Tell execute_writer the real filename so execute.py loads the right file
+            try:
+                from agents.execute_writer import set_dataset_path
+                set_dataset_path(uploaded_file.name)
+            except Exception:
+                pass
+
             st.markdown(f"""
             <div class="file-preview visible" style="margin-top:-10px; margin-bottom: 20px;">
               <div class="file-icon">📊</div>

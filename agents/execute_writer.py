@@ -25,6 +25,9 @@ append_existing_function_call(function_name, function_code, params,
 
 reset_execute_file()
     → Called at the start of each new analysis run to clear old entries.
+
+set_dataset_path(path)
+    → Called from app.py when a file is uploaded, so execute.py loads the right file.
 """
 
 from __future__ import annotations
@@ -252,6 +255,15 @@ def _write_file() -> None:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+def set_dataset_path(path: str) -> None:
+    """
+    Record the uploaded dataset filename so execute.py loads the right file.
+    Call this from app.py immediately after the file is uploaded.
+    """
+    global _DATASET_CSV_PATH
+    _DATASET_CSV_PATH = path
+
 
 def reset_execute_file(dataset_path: str = "", df=None) -> None:
     """

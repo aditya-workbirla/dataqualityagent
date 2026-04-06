@@ -21,7 +21,7 @@ from typing import Dict, Any, List, Optional
 # DATASET LOADING
 # Replace the path below with the actual path to your dataset.
 # ─────────────────────────────────────────────────────────────────
-DATASET_PATH = os.path.join(os.path.dirname(__file__), "data/sample_faulty_data.csv")
+DATASET_PATH = os.path.join(os.path.dirname(__file__), "data/VIL_P2_agentdata.xlsx")
 
 def load_dataset(path: str) -> pd.DataFrame:
     """Load dataset from CSV or Excel, auto-detecting format."""

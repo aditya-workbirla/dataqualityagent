@@ -90,11 +90,20 @@ One of exactly four values — choose the most appropriate:
 For each step that requires a function, add on the next line:
   → Function: `<function_name>` | Status: existing / generate_new | Params: <params or "none">
 
+Rules for Status:
+- Use `existing` ONLY if the exact function name appears in the AVAILABLE FUNCTIONS list above.
+- Use `generate_new` for ANY computation that has no matching existing function.
+- When Status is `generate_new`, you MUST also include it in FUNCTION GAPS below with full spec.
+
 ### FUNCTION GAPS
 (skip this section entirely if MODE is KB_ONLY or CONVERSATIONAL)
 
-- Gap 1: `<suggested_function_name>` — <one-line description of what it checks>
-- Gap 2: ...
+List every function marked `generate_new` above. For each one provide ALL four fields:
+- Gap N: `<exact_function_name>` — <one-line description>
+  → Signature: `def <exact_function_name>(series: pd.Series) -> dict:`
+  → Target column: `<exact column name from dataset>`
+  → Returns: <description of dict keys the function should return>
+
 (write "- None" if no gaps)
 
 ### EXPECTED OUTPUT

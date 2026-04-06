@@ -41,7 +41,10 @@ def get_analyst_system_prompt(
     4. CUSTOM FUNCTION GENERATION RULES:
         - DO NOT generate new custom functions during the initial data quality analysis phase.
         - You are ONLY allowed to use the `generate_and_test_custom_function` tool if the user asks a specific follow-up chat question requiring a custom test.
-        - When generating a function for a follow-up, ensure the function name is GLOBALLY UNIQUE (e.g., append the column name to the function name like `check_negative_pressure_blower_inlet`).
+        - When a Planner Execution Plan is provided (in the system injection above), every step marked `Status: generate_new` is MANDATORY — you MUST call `generate_and_test_custom_function` for each one. Do NOT skip them. Do NOT answer the question without executing all generate_new steps first.
+        - Use the exact `function_name`, `target_column`, and return-key spec written in the FUNCTION GAPS section of the plan.
+        - When generating a function for a follow-up, ensure the function name is GLOBALLY UNIQUE (e.g., append the column name: `check_negative_pressure_blower_inlet`).
+        - The function MUST take a single argument `series: pd.Series` and return a plain Python `dict` with JSON-serialisable values (use `int(x)`, `float(x)` — never raw numpy scalars).
         - Do not try more than once per concept if generation fails repeatedly.
     5. The system has several advanced domain physics and statistical functions available (Group 2 and Group 3) that require specific column parameters to run. You MUST use the `execute_existing_function_with_params` tool to run them if they are relevant to the user context.
         AVAILABLE ADVANCED FUNCTIONS:

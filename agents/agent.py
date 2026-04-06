@@ -655,6 +655,62 @@ def quality_analyst_node(state: AgentState) -> AgentState:
                 "You MUST follow this plan step by step to answer the question.\n\n"
                 + chat_plan
             )
+
+        # ── Extract FUNCTION GAPS from plan and build a mandatory tool checklist ──
+        import re as _re_plan
+        gaps_section = ""
+        gaps_match = _re_plan.search(
+            r"###\s*FUNCTION GAPS\s*\n(.*?)(?=\n###|\Z)",
+            chat_plan, _re_plan.DOTALL | _re_plan.IGNORECASE,
+        )
+        if gaps_match:
+            gaps_raw = gaps_match.group(1).strip()
+            # Only proceed if there are real gaps (not "None")
+            if gaps_raw and "none" not in gaps_raw.lower():
+                gaps_section = gaps_raw
+
+        if gaps_section:
+            # Build a mandatory tool-call checklist from the gaps
+            # Each Gap line: "- Gap N: `fn_name` — description"
+            # Sub-lines:     "  → Target column: `col`"
+            #                "  → Signature: ..."
+            #                "  → Returns: ..."
+            gap_blocks = _re_plan.split(r"\n(?=- Gap\s+\d+)", gaps_section)
+            checklist_lines = [
+                "## 🔴 MANDATORY TOOL CALLS — generate_new functions",
+                "",
+                "The Planner identified functions that DO NOT EXIST yet. "
+                "You MUST call `generate_and_test_custom_function` for EACH one below "
+                "BEFORE answering the question. Do NOT skip any.",
+                "",
+            ]
+            for idx, block in enumerate(gap_blocks, 1):
+                block = block.strip()
+                if not block:
+                    continue
+                # Extract function name
+                fn_match = _re_plan.search(r"`([^`]+)`", block)
+                fn_name  = fn_match.group(1) if fn_match else f"gap_function_{idx}"
+                # Extract target column
+                col_match = _re_plan.search(r"Target column[:\s]+`([^`]+)`", block, _re_plan.IGNORECASE)
+                target_col = col_match.group(1) if col_match else "(see plan)"
+                # Extract returns hint
+                ret_match = _re_plan.search(r"Returns[:\s]+(.+)", block, _re_plan.IGNORECASE)
+                returns_hint = ret_match.group(1).strip() if ret_match else "dict of stats"
+                # Extract description (first line after Gap N: `fn`)
+                desc_match = _re_plan.search(r"`[^`]+`\s*[—–-]+\s*(.+)", block)
+                description = desc_match.group(1).strip() if desc_match else block.splitlines()[0]
+
+                checklist_lines += [
+                    f"**Call {idx}: `{fn_name}`**",
+                    f"- target_column: `{target_col}`",
+                    f"- function_description: \"{description}\"",
+                    f"- code: write `def {fn_name}(series: pd.Series) -> dict:` "
+                      f"that returns `{{{returns_hint}}}`",
+                    "",
+                ]
+            injection_parts.append("\n".join(checklist_lines))
+
         if rag_chunks:
             injection_parts.append(
                 "## 📚 Retrieved Domain Knowledge (RAG — most relevant sections)\n\n"
