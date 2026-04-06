@@ -857,7 +857,7 @@ def should_continue(state: AgentState) -> str:
     # Anti-loop measure
     tool_message_count = sum(1 for m in messages if isinstance(m, ToolMessage) or (isinstance(m, dict) and m.get("role") == "tool"))
     if tool_message_count > 10:
-        return "end"
+        return "chat_end" if state.get("report") else "generate_report"
         
     if getattr(last_message, "tool_calls", None):
         return "continue"
