@@ -17,6 +17,7 @@ from prompts.knowledge_agent_prompts import (
 )
 from prompts.analyst_prompts import get_analyst_system_prompt
 from prompts.report_prompts import get_report_prompt
+from prompts.planner_prompts import get_planner_prompt
 
 # Define the LangGraph State type
 # This state dictionary is passed between every node in the graph.
@@ -30,6 +31,9 @@ class AgentState(TypedDict):
     bad_indices_per_column: dict
     report: str
     
+    # Follow-up chat planner
+    chat_plan: str          # Structured execution plan produced by the planner agent
+
     # Multi-Agent KB Validation Loop
     kb_candidate: List[Dict[str, Any]]
     kb_critique: Dict[str, Any]
@@ -527,6 +531,23 @@ def quality_analyst_node(state: AgentState) -> AgentState:
 
     if not messages:
         messages = [SystemMessage(content=system_prompt), HumanMessage(content="Please analyze the predefined function results summary using the provided context. If a custom test is needed, generate and run it. List all identified data quality issues.")]
+    else:
+        # Follow-up chat turn: inject the planner's execution plan as a system note
+        # so the analyst knows exactly what steps to execute.
+        chat_plan = state.get("chat_plan", "")
+        if chat_plan:
+            plan_injection = SystemMessage(content=(
+                f"## 📋 Execution Plan from Planner Agent\n\n"
+                f"The Planner Agent has analysed the user's question and produced the following plan. "
+                f"You MUST follow this plan step by step to answer the question.\n\n"
+                f"{chat_plan}"
+            ))
+            # Insert plan injection right before the last HumanMessage
+            messages = list(messages)
+            for i in range(len(messages) - 1, -1, -1):
+                if isinstance(messages[i], HumanMessage):
+                    messages.insert(i, plan_injection)
+                    break
         
     cleaned_messages = format_messages(messages)
     try:
@@ -652,13 +673,111 @@ def generate_report_node(state: AgentState) -> AgentState:
         )
         return {"report": fallback_report}
 
+def chat_planner_node(state: AgentState) -> AgentState:
+    """
+    Follow-up Chat Planner Agent.
+
+    Runs ONLY during follow-up chat turns (when state["report"] already exists).
+    Reads the latest HumanMessage, inspects available DB functions, and produces
+    a structured Execution Plan that is:
+      - Printed to the server terminal (for developer visibility)
+      - Stored in state["chat_plan"] so the quality_analyst_node can follow it
+    """
+    import json
+    import sqlite3
+
+    messages = state.get("messages", [])
+
+    # Identify the latest human question
+    user_question = ""
+    for m in reversed(messages):
+        if isinstance(m, HumanMessage):
+            user_question = m.content
+            break
+    if not user_question:
+        return {"chat_plan": ""}
+
+    # Build dataset metadata
+    dataset_metadata = "Dataset dimensions unavailable."
+    try:
+        raw_data = json.loads(state.get("df_json", "[]"))
+        num_rows = len(raw_data)
+        columns = list(raw_data[0].keys()) if num_rows > 0 else []
+        dataset_metadata = f"{num_rows} rows × {len(columns)} columns\nColumns: {', '.join(columns)}"
+    except Exception:
+        pass
+
+    user_context = state.get("user_context_prompt", "No context provided.")
+    knowledge_base = state.get("retrieved_knowledge", "No knowledge base loaded.")
+
+    # Fetch ALL functions from DB (all groups) for the planner to reason about
+    db_path = "database/app.db"
+    available_functions = "  (Could not load functions from database)"
+    try:
+        with sqlite3.connect(db_path, timeout=5.0) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT function_name, function_description, function_group, approved_by_team "
+                "FROM data_quality_functions ORDER BY function_group, function_name"
+            )
+            rows = cursor.fetchall()
+            if rows:
+                group_labels = {1: "Group 1 — Dataset-Level", 2: "Group 2 — Metadata-Dependent",
+                                3: "Group 3 — Domain Logic", 4: "Group 4 — AI Generated"}
+                lines = []
+                current_group = None
+                for fn_name, fn_desc, fn_group, approved in rows:
+                    if fn_group != current_group:
+                        current_group = fn_group
+                        lines.append(f"\n**{group_labels.get(fn_group, f'Group {fn_group}')}**")
+                    status = "✅ approved" if approved else "⚠️ quarantined"
+                    lines.append(f"  - `{fn_name}` [{status}]: {fn_desc}")
+                available_functions = "\n".join(lines)
+    except Exception as e:
+        available_functions = f"  (DB error: {e})"
+
+    # Call the LLM planner
+    llm = get_llm(timeout_seconds=60.0)
+    planner_prompt = get_planner_prompt(
+        user_question=user_question,
+        dataset_metadata=dataset_metadata,
+        user_context=user_context,
+        available_functions=available_functions,
+        knowledge_base=knowledge_base,
+    )
+
+    try:
+        response = llm.invoke([SystemMessage(content=planner_prompt)])
+        plan = response.content
+    except Exception as e:
+        plan = f"⚠️ Planner agent failed: {e}\nProceeding without a structured plan."
+
+    # ── Print plan to terminal ─────────────────────────────────────────────
+    separator = "=" * 72
+    print(f"\n{separator}")
+    print(f"📋  CHAT PLANNER — execution plan for follow-up question")
+    print(separator)
+    print(f"❓  Question : {user_question}")
+    print(separator)
+    print(plan)
+    print(f"{separator}\n")
+    # ───────────────────────────────────────────────────────────────────────
+
+    return {"chat_plan": plan}
+
+
 def route_to_start(state: AgentState) -> str:
     """
-    Conditional entry point: bypass the orchestrator if this is a follow-up chat.
-    If function_results_summary is already populated, do not run it again.
+    Conditional entry point:
+    - First analysis run    → collect_function_results
+    - Follow-up chat turn   → chat_planner  (new), then check_existing_kb → quality_analyst
     """
     summary = state.get("function_results_summary", {})
     if summary:
+        # Follow-up: if there's already a report AND the last message is a HumanMessage,
+        # run the planner first.
+        if state.get("report"):
+            return "chat_planner"
         return "check_existing_kb"
     return "collect_function_results"
 
@@ -701,6 +820,7 @@ def build_data_quality_graph(checkpointer=None) -> StateGraph:
     workflow.add_node("knowledge_agent", knowledge_agent_node)
     workflow.add_node("critique_agent", critique_agent_node)
     workflow.add_node("finalize_kb", finalize_kb_node)
+    workflow.add_node("chat_planner", chat_planner_node)
     workflow.add_node("quality_analyst", quality_analyst_node)
     workflow.add_node("tool_execution", tool_execution_node)
     workflow.add_node("generate_report", generate_report_node)
@@ -710,11 +830,16 @@ def build_data_quality_graph(checkpointer=None) -> StateGraph:
         route_to_start,
         {
             "collect_function_results": "collect_function_results",
-            "check_existing_kb": "check_existing_kb"
+            "check_existing_kb": "check_existing_kb",
+            "chat_planner": "chat_planner",
         }
     )
     workflow.add_edge("collect_function_results", "check_existing_kb")
     
+    # After the planner finishes, hand off directly to the quality analyst
+    # (KB already exists in state from the first analysis run)
+    workflow.add_edge("chat_planner", "quality_analyst")
+
     workflow.add_conditional_edges(
         "check_existing_kb",
         route_after_kb_check,

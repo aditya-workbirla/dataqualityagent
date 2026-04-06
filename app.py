@@ -166,6 +166,60 @@ if "thread_id" not in st.session_state:
 def convert_df_to_csv(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
 
+def convert_report_to_docx(report_md: str) -> bytes:
+    """
+    Converts a Markdown report string to a .docx file in memory.
+    Headings (#, ##, ###) become Word headings; **bold** becomes bold runs;
+    everything else becomes normal paragraphs.
+    """
+    from docx import Document
+    from docx.shared import Pt
+    import re
+
+    doc = Document()
+
+    # Style the default paragraph font
+    style = doc.styles["Normal"]
+    style.font.name = "Calibri"
+    style.font.size = Pt(11)
+
+    def add_run_with_bold(para, text: str):
+        """Split text on **bold** markers and add runs accordingly."""
+        parts = re.split(r"\*\*(.*?)\*\*", text)
+        for i, part in enumerate(parts):
+            run = para.add_run(part)
+            if i % 2 == 1:   # odd index = inside ** **
+                run.bold = True
+
+    for line in report_md.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            doc.add_paragraph("")
+            continue
+
+        if stripped.startswith("### "):
+            p = doc.add_heading(stripped[4:], level=3)
+        elif stripped.startswith("## "):
+            p = doc.add_heading(stripped[3:], level=2)
+        elif stripped.startswith("# "):
+            p = doc.add_heading(stripped[2:], level=1)
+        elif stripped.startswith("- ") or stripped.startswith("* "):
+            p = doc.add_paragraph(style="List Bullet")
+            add_run_with_bold(p, stripped[2:])
+        elif re.match(r"^\d+\.\s", stripped):
+            p = doc.add_paragraph(style="List Number")
+            add_run_with_bold(p, re.sub(r"^\d+\.\s", "", stripped))
+        elif stripped.startswith("---"):
+            doc.add_paragraph("─" * 60)
+        else:
+            p = doc.add_paragraph()
+            add_run_with_bold(p, stripped)
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf.read()
+
 # Sidebar Session History
 with st.sidebar:
     st.header("🗄️ Session History")
@@ -286,6 +340,7 @@ with tab1:
         "knowledge_agent":          ("🔍", "Building domain knowledge base (Process / Physics / Equipment / OEM)…"),
         "critique_agent":           ("🧐", "Critiquing & scoring the knowledge base…"),
         "finalize_kb":              ("💾", "Finalising & saving the knowledge base…"),
+        "chat_planner":             ("📋", "Planner agent is mapping out execution steps…"),
         "quality_analyst":          ("🧠", "Reasoning agent is analysing data quality…"),
         "tool_execution":           ("🔧", "Executing custom data quality function…"),
         "generate_report":          ("📋", "Generating the final quality report…"),
@@ -384,12 +439,28 @@ with tab1:
         st.markdown(f'<div class="analysis-box">{st.session_state["report"]}</div></div>', unsafe_allow_html=True)
         
         st.markdown("<div class='spacer-20'></div>", unsafe_allow_html=True)
-        st.download_button(
-            label="⬇ Export Cleaned Dataset (CSV)",
-            data=convert_df_to_csv(st.session_state["annotated_df"]),
-            file_name="analyzed_data.csv",
-            mime="text/csv"
-        )
+        
+        col_dl1, col_dl2 = st.columns([1, 1])
+        with col_dl1:
+            try:
+                docx_bytes = convert_report_to_docx(st.session_state["report"])
+                st.download_button(
+                    label="⬇ Download Report (.docx)",
+                    data=docx_bytes,
+                    file_name="data_quality_report.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    use_container_width=True,
+                )
+            except Exception as _docx_err:
+                st.warning(f"Could not generate .docx: {_docx_err}")
+        with col_dl2:
+            st.download_button(
+                label="⬇ Export Dataset (CSV)",
+                data=convert_df_to_csv(st.session_state["annotated_df"]),
+                file_name="analyzed_data.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
         
         st.markdown("<hr class='divider'>", unsafe_allow_html=True)
         st.markdown(ui_components.get_header_html("Follow-Up", "Chat Interface", "", "step 03 — conversational query", ""), unsafe_allow_html=True)
@@ -413,6 +484,7 @@ with tab1:
                 config = {"configurable": {"thread_id": st.session_state["thread_id"]}}
 
                 follow_state = None
+                planner_plan = ""
                 for chunk in app.stream({"messages": [HumanMessage(content=prompt)]}, config, stream_mode="updates"):
                     for node_name, node_output in chunk.items():
                         icon, label = _NODE_LABELS.get(node_name, ("🔄", f"Running `{node_name}`…"))
@@ -420,6 +492,9 @@ with tab1:
                             msgs = node_output.get("messages", [])
                             tool_names = [m.get("name","tool") if isinstance(m,dict) else getattr(m,"name","tool") for m in msgs]
                             label = f"🔧 Executing tool: `{', '.join(set(tool_names)) or 'custom function'}`…"
+                        # Capture the plan text when planner node completes
+                        if node_name == "chat_planner":
+                            planner_plan = node_output.get("chat_plan", "")
                         chat_placeholder.markdown(f"{icon} **{label}**")
                         chat_status.update(label=f"{icon} {label}")
                         if node_output:
@@ -427,6 +502,11 @@ with tab1:
 
                 chat_status.update(label="✅ Done", state="complete", expanded=False)
                 chat_placeholder.empty()
+
+                # Show the planner's execution plan as an expander above the answer
+                if planner_plan:
+                    with st.expander("📋 Execution Plan (from Planner Agent)", expanded=False):
+                        st.markdown(planner_plan)
 
                 ai_response = follow_state["messages"][-1].content if follow_state and follow_state.get("messages") else "No response."
                 st.session_state["chat_history"].append({"role": "assistant", "content": ai_response})

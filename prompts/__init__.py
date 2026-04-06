@@ -10,6 +10,7 @@ from prompts.knowledge_agent_prompts import (
 )
 from prompts.analyst_prompts import get_analyst_system_prompt
 from prompts.report_prompts import get_report_prompt
+from prompts.planner_prompts import get_planner_prompt
 
 __all__ = [
     "get_base_context_block",
@@ -21,4 +22,5 @@ __all__ = [
     "get_critique_prompt",
     "get_analyst_system_prompt",
     "get_report_prompt",
+    "get_planner_prompt",
 ]
