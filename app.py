@@ -155,6 +155,9 @@ if "agent_state" not in st.session_state:
     st.session_state["agent_state"] = None
 if "chat_history" not in st.session_state:
     st.session_state["chat_history"] = []
+if "chat_execution_logs" not in st.session_state:
+    # Keyed by chat turn index (int) → dict with plan + function execution details
+    st.session_state["chat_execution_logs"] = {}
 if "checkpointer" not in st.session_state:
     conn = sqlite3.connect("database/app.db", check_same_thread=False)
     saver = SqliteSaver(conn)
@@ -281,6 +284,7 @@ with st.sidebar:
                         elif isinstance(m, AIMessage) and m.content:
                             chat_hist.append({"role": "assistant", "content": m.content})
                 st.session_state["chat_history"] = chat_hist
+                st.session_state["chat_execution_logs"] = {}  # logs don't persist across sessions
                 
                 # Rebuild Knowledge Graph since it's not natively in state
                 if st.session_state["annotated_df"] is not None:
@@ -349,6 +353,7 @@ with tab1:
     if run_button and df is not None:
         st.session_state["thread_id"] = str(uuid.uuid4())
         st.session_state["chat_history"] = []
+        st.session_state["chat_execution_logs"] = {}
 
         app_graph = build_data_quality_graph(checkpointer=st.session_state["checkpointer"])
         config    = {"configurable": {"thread_id": st.session_state["thread_id"]}}
@@ -466,10 +471,34 @@ with tab1:
         st.markdown(ui_components.get_header_html("Follow-Up", "Chat Interface", "", "step 03 — conversational query", ""), unsafe_allow_html=True)
         st.markdown("<div class='spacer-20'></div>", unsafe_allow_html=True)
         
-        # Render the chat dialog
-        for msg in st.session_state.get("chat_history", []):
+        # Render the chat dialog — each assistant turn may have an execution log expander
+        for turn_idx, msg in enumerate(st.session_state.get("chat_history", [])):
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
+            # After each assistant message, show execution log if one exists for that turn
+            if msg["role"] == "assistant":
+                exec_log = st.session_state["chat_execution_logs"].get(turn_idx)
+                if exec_log:
+                    with st.expander("📋 Execution Log — what the agent planned & ran", expanded=False):
+                        # ── Plan ──────────────────────────────────────────────
+                        if exec_log.get("plan"):
+                            st.markdown("### 🗺️ Planner's Execution Plan")
+                            st.markdown(exec_log["plan"])
+                        # ── Functions called ──────────────────────────────────
+                        existing = exec_log.get("existing_functions", [])
+                        new_funcs = exec_log.get("new_functions", [])
+                        if existing or new_funcs:
+                            st.divider()
+                            st.markdown("### 🔧 Functions Executed")
+                            if existing:
+                                st.markdown("**Existing DB functions called:**")
+                                for fn in existing:
+                                    st.markdown(f"- ✅ `{fn['name']}`" + (f" — params: `{fn['params']}`" if fn.get('params') else ""))
+                            if new_funcs:
+                                st.markdown("**New functions generated & saved:**")
+                                for fn in new_funcs:
+                                    st.markdown(f"- 🆕 `{fn['name']}` — {fn.get('description', '')} *(saved to DB as Group 4, pending approval)*")
+
                 
         # Handle new prompts
         if prompt := st.chat_input("Ask a follow-up question about this dataset..."):
@@ -480,21 +509,48 @@ with tab1:
             with st.status("🧠 Analysing follow-up…", expanded=True) as chat_status:
                 chat_placeholder = st.empty()
                 from langchain_core.messages import HumanMessage
+                import json as _json
                 app = build_data_quality_graph(checkpointer=st.session_state["checkpointer"])
                 config = {"configurable": {"thread_id": st.session_state["thread_id"]}}
 
-                follow_state = None
-                planner_plan = ""
+                follow_state  = None
+                planner_plan  = ""
+                existing_fns  = []   # {"name": str, "params": dict}
+                new_fns       = []   # {"name": str, "description": str}
+
                 for chunk in app.stream({"messages": [HumanMessage(content=prompt)]}, config, stream_mode="updates"):
                     for node_name, node_output in chunk.items():
                         icon, label = _NODE_LABELS.get(node_name, ("🔄", f"Running `{node_name}`…"))
-                        if node_name == "tool_execution":
-                            msgs = node_output.get("messages", [])
-                            tool_names = [m.get("name","tool") if isinstance(m,dict) else getattr(m,"name","tool") for m in msgs]
-                            label = f"🔧 Executing tool: `{', '.join(set(tool_names)) or 'custom function'}`…"
-                        # Capture the plan text when planner node completes
+
+                        # ── Planner: capture plan text ────────────────────────
                         if node_name == "chat_planner":
                             planner_plan = node_output.get("chat_plan", "")
+
+                        # ── Tool execution: track which functions ran ─────────
+                        if node_name == "tool_execution":
+                            msgs = node_output.get("messages", [])
+                            tool_names_set = set()
+                            for m in msgs:
+                                raw_name = m.get("name", "") if isinstance(m, dict) else getattr(m, "name", "")
+                                tool_names_set.add(raw_name)
+                                # Parse the tool result JSON for function metadata
+                                raw_content = m.get("content", "") if isinstance(m, dict) else getattr(m, "content", "")
+                                try:
+                                    res = _json.loads(raw_content) if isinstance(raw_content, str) else {}
+                                except Exception:
+                                    res = {}
+                                if raw_name == "generate_and_test_custom_function":
+                                    fn_name = res.get("function_name", "unknown")
+                                    # Recover description from the AI message tool_calls before this
+                                    new_fns.append({"name": fn_name, "description": res.get("database_status", "")})
+                                elif raw_name == "execute_existing_function_with_params":
+                                    existing_fns.append({
+                                        "name": res.get("function_name", "unknown"),
+                                        "params": res.get("params_used", {})
+                                    })
+                            label = f"🔧 Executing tool: `{', '.join(tool_names_set) or 'custom function'}`…"
+                            icon  = "🔧"
+
                         chat_placeholder.markdown(f"{icon} **{label}**")
                         chat_status.update(label=f"{icon} {label}")
                         if node_output:
@@ -503,13 +559,22 @@ with tab1:
                 chat_status.update(label="✅ Done", state="complete", expanded=False)
                 chat_placeholder.empty()
 
-                # Show the planner's execution plan as an expander above the answer
-                if planner_plan:
-                    with st.expander("📋 Execution Plan (from Planner Agent)", expanded=False):
-                        st.markdown(planner_plan)
-
-                ai_response = follow_state["messages"][-1].content if follow_state and follow_state.get("messages") else "No response."
+                ai_response = (
+                    follow_state["messages"][-1].content
+                    if follow_state and follow_state.get("messages")
+                    else "No response."
+                )
                 st.session_state["chat_history"].append({"role": "assistant", "content": ai_response})
+
+                # ── Persist execution log keyed to this assistant turn ────────
+                # The assistant turn index = len(chat_history) - 1 (just appended)
+                turn_idx = len(st.session_state["chat_history"]) - 1
+                if planner_plan or existing_fns or new_fns:
+                    st.session_state["chat_execution_logs"][turn_idx] = {
+                        "plan":               planner_plan,
+                        "existing_functions": existing_fns,
+                        "new_functions":      new_fns,
+                    }
                 st.rerun()
 
 with tab2:
