@@ -386,7 +386,18 @@ with tab1:
                                 for m in msgs
                             ]
                             tool_str = ", ".join(set(tool_names)) or "custom function"
-                            label = f"🔧 Executing tool: `{tool_str}` (call #{tool_call_count})…"
+                            # Check if Code Tester auto-corrected anything
+                            auto_fixes = []
+                            for m in msgs:
+                                raw_c = m.get("content", "") if isinstance(m, dict) else getattr(m, "content", "")
+                                try:
+                                    _r = json.loads(raw_c) if isinstance(raw_c, str) else {}
+                                    if _r.get("code_auto_corrected"):
+                                        auto_fixes.append(_r.get("function_name", "fn"))
+                                except Exception:
+                                    pass
+                            fix_note = f" — 🔄 Code Tester auto-fixed: {', '.join(auto_fixes)}" if auto_fixes else ""
+                            label = f"🔧 Executing tool: `{tool_str}` (call #{tool_call_count}){fix_note}…"
                             icon  = "🔧"
 
                         # Special-case: knowledge_agent — show retry count
@@ -446,7 +457,7 @@ with tab1:
         
         st.markdown("<div class='spacer-20'></div>", unsafe_allow_html=True)
         
-        col_dl1, col_dl2 = st.columns([1, 1])
+        col_dl1, col_dl2, col_dl3 = st.columns([1, 1, 1])
         with col_dl1:
             try:
                 docx_bytes = convert_report_to_docx(st.session_state["report"])
@@ -467,6 +478,20 @@ with tab1:
                 mime="text/csv",
                 use_container_width=True,
             )
+        with col_dl3:
+            try:
+                with open("execute.py", "r", encoding="utf-8") as _ef:
+                    _execute_src = _ef.read()
+                st.download_button(
+                    label="⬇ Download execute.py",
+                    data=_execute_src.encode("utf-8"),
+                    file_name="execute.py",
+                    mime="text/x-python",
+                    use_container_width=True,
+                    help="Runnable Python script with all functions executed this session",
+                )
+            except Exception:
+                st.info("execute.py will appear here once functions have been run.")
         
         st.markdown("<hr class='divider'>", unsafe_allow_html=True)
         st.markdown(ui_components.get_header_html("Follow-Up", "Chat Interface", "", "step 03 — conversational query", ""), unsafe_allow_html=True)
@@ -578,7 +603,16 @@ with tab1:
                             if new_funcs:
                                 st.markdown("*New functions generated & saved:*")
                                 for fn in new_funcs:
-                                    st.markdown(f"- 🆕 `{fn['name']}` *(Group 4, pending approval)*")
+                                    attempts = fn.get("tester_attempts", 1)
+                                    auto_fixed = fn.get("auto_corrected", False)
+                                    if auto_fixed:
+                                        tester_badge = f"🔄 auto-corrected in {attempts} attempt{'s' if attempts != 1 else ''}"
+                                    else:
+                                        tester_badge = f"✔ passed in {attempts} attempt{'s' if attempts != 1 else ''}"
+                                    st.markdown(
+                                        f"- 🆕 `{fn['name']}` *(Group 4, pending approval)* "
+                                        f"— Code Tester: {tester_badge}"
+                                    )
 
                 
         # Handle new prompts
@@ -632,7 +666,14 @@ with tab1:
                                     res = {}
                                 if raw_name == "generate_and_test_custom_function":
                                     fn_name = res.get("function_name", "unknown")
-                                    new_fns.append({"name": fn_name, "description": res.get("database_status", "")})
+                                    auto_fixed = res.get("code_auto_corrected", False)
+                                    tester_attempts = res.get("code_tester_attempts", 1)
+                                    new_fns.append({
+                                        "name": fn_name,
+                                        "description": res.get("database_status", ""),
+                                        "auto_corrected": auto_fixed,
+                                        "tester_attempts": tester_attempts,
+                                    })
                                 elif raw_name == "execute_existing_function_with_params":
                                     existing_fns.append({
                                         "name": res.get("function_name", "unknown"),

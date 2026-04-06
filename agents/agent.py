@@ -174,6 +174,7 @@ def sanitize_for_msgpack(obj):
 def collect_function_results_node(state: AgentState) -> AgentState:
     """
     Runs all predefined statistical and quality checks on the raw dataset locally.
+    Also resets execute.py so it starts fresh for this analysis run.
     """
     import pandas as pd
     import io
@@ -194,6 +195,13 @@ def collect_function_results_node(state: AgentState) -> AgentState:
     
     # Store df globally so the custom function generator can test it tools.py
     set_current_df(df)
+
+    # ── Reset execute.py for this new analysis run ─────────────────────────
+    try:
+        from agents.execute_writer import reset_execute_file
+        reset_execute_file(dataset_path="", df=df)
+    except Exception as _ew_err:
+        print(f"⚠️  execute.py reset failed (non-fatal): {_ew_err}")
     
     return {"function_results_summary": summary}
 
