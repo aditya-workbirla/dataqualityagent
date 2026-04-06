@@ -39,6 +39,7 @@ class AgentState(TypedDict):
     
     # Follow-up chat planner
     chat_plan: str          # Structured execution plan produced by the planner agent
+    chat_mode: str          # KB_ONLY | DATA_ONLY | BOTH | CONVERSATIONAL
     rag_chunks: str         # Top-k retrieved KB chunks for the current follow-up query
 
     # Multi-Agent KB Validation Loop
@@ -524,6 +525,12 @@ def rag_retrieval_node(state: AgentState, config: RunnableConfig) -> AgentState:
     if not state.get("report"):
         return {"rag_chunks": ""}
 
+    # Skip RAG entirely when the planner determined no KB reasoning is needed
+    chat_mode = state.get("chat_mode", "BOTH").upper()
+    if chat_mode in ("DATA_ONLY", "CONVERSATIONAL"):
+        print(f"⏭️  RAG retrieval skipped — mode is {chat_mode}")
+        return {"rag_chunks": ""}
+
     thread_id = config.get("configurable", {}).get("thread_id", "global")
 
     # If embeddings don't exist yet (session resume), build them now
@@ -574,7 +581,13 @@ def quality_analyst_node(state: AgentState) -> AgentState:
     messages = state.get("messages", [])
     
     llm = get_llm(timeout_seconds=180.0)
-    llm_with_tools = llm.bind_tools([generate_and_test_custom_function, execute_existing_function_with_params])
+
+    # Gate tool binding on chat mode — skip function tools when only KB reasoning is needed
+    chat_mode = state.get("chat_mode", "").upper()
+    if chat_mode in ("KB_ONLY", "CONVERSATIONAL"):
+        llm_with_tools = llm   # No tools — pure reasoning/KB answer
+    else:
+        llm_with_tools = llm.bind_tools([generate_and_test_custom_function, execute_existing_function_with_params])
     
     # Fetch parameters for Group 2 and 3 functions so LLM knows what to call
     import sqlite3
@@ -641,6 +654,30 @@ def quality_analyst_node(state: AgentState) -> AgentState:
                 "Do NOT contradict them.\n\n"
                 + rag_chunks
             )
+
+        # Mode-specific instructions to keep the analyst focused
+        mode_instruction = ""
+        if chat_mode == "KB_ONLY":
+            mode_instruction = (
+                "## ⚠️ MODE: KB_ONLY\n"
+                "Answer using ONLY the domain knowledge base sections above. "
+                "Do NOT call any tools or run any functions. "
+                "Do NOT compute statistics from data."
+            )
+        elif chat_mode == "DATA_ONLY":
+            mode_instruction = (
+                "## ⚠️ MODE: DATA_ONLY\n"
+                "Answer using ONLY data computations (run functions / generate custom checks). "
+                "Do NOT reference the knowledge base — focus purely on what the data shows."
+            )
+        elif chat_mode == "CONVERSATIONAL":
+            mode_instruction = (
+                "## ⚠️ MODE: CONVERSATIONAL\n"
+                "Answer conversationally from the existing analysis context. "
+                "Do NOT call any tools or retrieve any KB sections."
+            )
+        if mode_instruction:
+            injection_parts.insert(0, mode_instruction)
 
         if injection_parts:
             injection_msg = SystemMessage(content="\n\n---\n\n".join(injection_parts))
@@ -876,7 +913,15 @@ def chat_planner_node(state: AgentState) -> AgentState:
     print(f"{separator}\n")
     # ───────────────────────────────────────────────────────────────────────
 
-    return {"chat_plan": plan}
+    # ── Extract MODE from plan ─────────────────────────────────────────────
+    import re as _re
+    mode = "BOTH"  # safe default
+    mode_match = _re.search(r"MODE\s*:\s*(KB_ONLY|DATA_ONLY|BOTH|CONVERSATIONAL)", plan, _re.IGNORECASE)
+    if mode_match:
+        mode = mode_match.group(1).upper()
+    print(f"🎯  Planner MODE = {mode}\n")
+
+    return {"chat_plan": plan, "chat_mode": mode}
 
 
 def route_to_start(state: AgentState) -> str:

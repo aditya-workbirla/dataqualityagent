@@ -481,38 +481,104 @@ with tab1:
                 exec_log = st.session_state["chat_execution_logs"].get(turn_idx)
                 if exec_log:
                     with st.expander("📋 Execution Log — what the agent planned & ran", expanded=False):
-                        # ── Plan ──────────────────────────────────────────────
+                        # ── Plan: structured point-by-point display ───────────
                         if exec_log.get("plan"):
-                            st.markdown("### 🗺️ Planner's Execution Plan")
-                            st.markdown(exec_log["plan"])
+                            raw_plan = exec_log["plan"]
+
+                            # Extract MODE badge
+                            import re as _re
+                            mode_match = _re.search(
+                                r"MODE\s*[:\-]\s*(KB_ONLY|DATA_ONLY|BOTH|CONVERSATIONAL)",
+                                raw_plan, _re.IGNORECASE
+                            )
+                            mode_val = mode_match.group(1).upper() if mode_match else "BOTH"
+                            mode_colours = {
+                                "KB_ONLY":       ("🟣", "Knowledge Base Only"),
+                                "DATA_ONLY":     ("🟠", "Data Computation Only"),
+                                "BOTH":          ("🔵", "KB + Data Computation"),
+                                "CONVERSATIONAL":("⚪", "Conversational"),
+                            }
+                            mode_icon, mode_label = mode_colours.get(mode_val, ("🔵", mode_val))
+                            st.markdown(f"**Execution Mode:** {mode_icon} `{mode_val}` — {mode_label}")
+                            st.divider()
+
+                            # Helper: extract a section between two headings
+                            def _extract_section(text: str, heading: str) -> str:
+                                pattern = rf"###\s*{_re.escape(heading)}\s*\n(.*?)(?=\n###|\Z)"
+                                m = _re.search(pattern, text, _re.DOTALL | _re.IGNORECASE)
+                                return m.group(1).strip() if m else ""
+
+                            # UNDERSTANDING
+                            understanding = _extract_section(raw_plan, "UNDERSTANDING")
+                            if understanding:
+                                st.markdown("**🧠 Understanding**")
+                                for line in understanding.splitlines():
+                                    line = line.strip().lstrip("- ").strip()
+                                    if line:
+                                        st.markdown(f"- {line}")
+
+                            # EXECUTION STEPS
+                            steps = _extract_section(raw_plan, "EXECUTION STEPS")
+                            if steps:
+                                st.markdown("**🪜 Execution Steps**")
+                                for line in steps.splitlines():
+                                    stripped = line.strip()
+                                    if not stripped:
+                                        continue
+                                    if stripped.startswith("→"):
+                                        # Sub-detail line (function info)
+                                        st.markdown(f"  {stripped}")
+                                    elif stripped.startswith("-"):
+                                        st.markdown(stripped)
+                                    else:
+                                        st.markdown(f"- {stripped}")
+
+                            # FUNCTION GAPS
+                            gaps = _extract_section(raw_plan, "FUNCTION GAPS")
+                            if gaps and "none" not in gaps.lower():
+                                st.markdown("**🔩 Function Gaps (to be generated)**")
+                                for line in gaps.splitlines():
+                                    stripped = line.strip()
+                                    if stripped and stripped not in ("-", "- None"):
+                                        st.markdown(f"  {stripped}" if stripped.startswith("→") else stripped)
+
+                            # EXPECTED OUTPUT
+                            expected = _extract_section(raw_plan, "EXPECTED OUTPUT")
+                            if expected:
+                                st.markdown("**📤 Expected Output**")
+                                for line in expected.splitlines():
+                                    line = line.strip().lstrip("- ").strip()
+                                    if line:
+                                        st.markdown(f"- {line}")
+
                         # ── RAG chunks retrieved ──────────────────────────────
                         if exec_log.get("rag_chunks"):
                             st.divider()
-                            st.markdown("### 🔎 Knowledge Base Sections Retrieved (RAG)")
-                            # Show each chunk as a compact expander
+                            st.markdown("**🔎 Knowledge Base Sections Retrieved (RAG)**")
                             raw = exec_log["rag_chunks"]
                             chunk_blocks = [b.strip() for b in raw.split("--- Chunk ") if b.strip()]
                             for block in chunk_blocks:
-                                # First line is "N: [Category] Section heading ---"
                                 first_nl = block.find("\n")
                                 header = block[:first_nl].rstrip(" -") if first_nl != -1 else block
                                 body   = block[first_nl:].strip() if first_nl != -1 else ""
                                 with st.expander(f"📄 {header}", expanded=False):
                                     st.markdown(body)
+
                         # ── Functions called ──────────────────────────────────
                         existing = exec_log.get("existing_functions", [])
                         new_funcs = exec_log.get("new_functions", [])
                         if existing or new_funcs:
                             st.divider()
-                            st.markdown("### 🔧 Functions Executed")
+                            st.markdown("**🔧 Functions Executed**")
                             if existing:
-                                st.markdown("**Existing DB functions called:**")
+                                st.markdown("*Existing DB functions called:*")
                                 for fn in existing:
-                                    st.markdown(f"- ✅ `{fn['name']}`" + (f" — params: `{fn['params']}`" if fn.get('params') else ""))
+                                    params_str = f" — params: `{fn['params']}`" if fn.get('params') else ""
+                                    st.markdown(f"- ✅ `{fn['name']}`{params_str}")
                             if new_funcs:
-                                st.markdown("**New functions generated & saved:**")
+                                st.markdown("*New functions generated & saved:*")
                                 for fn in new_funcs:
-                                    st.markdown(f"- 🆕 `{fn['name']}` — {fn.get('description', '')} *(saved to DB as Group 4, pending approval)*")
+                                    st.markdown(f"- 🆕 `{fn['name']}` *(Group 4, pending approval)*")
 
                 
         # Handle new prompts
@@ -548,6 +614,8 @@ with tab1:
                             n_chunks = rag_chunks_text.count("--- Chunk ")
                             if n_chunks:
                                 label = f"🔎 Retrieved {n_chunks} relevant KB sections via RAG…"
+                            else:
+                                label = "🔎 RAG retrieval skipped (DATA_ONLY or CONVERSATIONAL mode)"
 
                         # ── Tool execution: track which functions ran ─────────
                         if node_name == "tool_execution":
@@ -591,8 +659,16 @@ with tab1:
                 # ── Persist execution log keyed to this assistant turn ────────
                 turn_idx = len(st.session_state["chat_history"]) - 1
                 if planner_plan or existing_fns or new_fns or rag_chunks_text:
+                    # Extract mode from planner output for badge display
+                    import re as _re2
+                    _mode_m = _re2.search(
+                        r"MODE\s*[:\-]\s*(KB_ONLY|DATA_ONLY|BOTH|CONVERSATIONAL)",
+                        planner_plan, _re2.IGNORECASE
+                    )
+                    stored_mode = _mode_m.group(1).upper() if _mode_m else "BOTH"
                     st.session_state["chat_execution_logs"][turn_idx] = {
                         "plan":               planner_plan,
+                        "chat_mode":          stored_mode,
                         "rag_chunks":         rag_chunks_text,
                         "existing_functions": existing_fns,
                         "new_functions":      new_fns,
