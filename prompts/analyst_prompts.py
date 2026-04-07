@@ -61,7 +61,7 @@ def get_analyst_system_prompt(
               return int((df[col] < 0).sum())
           neg_pressure = count_negatives("pressure_bar")
           neg_temp = count_negatives("temperature_c")
-          RESULT = {"negative_pressure_count": neg_pressure, "negative_temp_count": neg_temp}
+          RESULT = {{"negative_pressure_count": neg_pressure, "negative_temp_count": neg_temp}}
           ```
     5. The system has several advanced domain physics and statistical functions available (Group 2 and Group 3) that require specific column parameters to run. You MUST use the `execute_existing_function_with_params` tool to run them if they are relevant to the user context.
         AVAILABLE ADVANCED FUNCTIONS:
