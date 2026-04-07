@@ -61,12 +61,39 @@ def format_messages(messages):
     2. Orphaned ToolMessages (no preceding AIMessage with tool_calls) are dropped.
     3. AIMessage with tool_calls but empty content gets a filler string so the
        API doesn't reject it.
+
+    NOTE: LangGraph stores tool results as plain dicts {"role":"tool", ...} as
+    well as ToolMessage objects — both are handled here.
     """
     cleaned = []
-    # Set of tool_call_ids that have been answered by a ToolMessage
-    answered_ids: set = set()
     # tool_call_ids that are still outstanding (from the last AIMessage with tool_calls)
     outstanding_ids: set = set()
+
+    def _is_tool_msg(m) -> bool:
+        """True for both ToolMessage objects and {"role":"tool"} dicts."""
+        if isinstance(m, ToolMessage):
+            return True
+        if isinstance(m, dict) and m.get("role") == "tool":
+            return True
+        return False
+
+    def _tool_call_id(m):
+        """Extract tool_call_id from either a ToolMessage or a dict."""
+        if isinstance(m, ToolMessage):
+            return getattr(m, "tool_call_id", None)
+        if isinstance(m, dict):
+            return m.get("tool_call_id")
+        return None
+
+    def _to_tool_message(m) -> ToolMessage:
+        """Normalise a tool result dict → ToolMessage object."""
+        if isinstance(m, ToolMessage):
+            return m
+        return ToolMessage(
+            content=str(m.get("content", "")),
+            tool_call_id=m.get("tool_call_id", ""),
+            name=m.get("name", ""),
+        )
 
     def _flush_outstanding():
         """Insert synthetic ToolMessages for any un-answered tool_call_ids."""
@@ -77,12 +104,11 @@ def format_messages(messages):
                     tool_call_id=tid,
                 )
             )
-            answered_ids.add(tid)
         outstanding_ids.clear()
 
     for m in messages:
         if isinstance(m, AIMessage):
-            # Before appending a new AIMessage, ensure previous tool_calls are answered
+            # Before a new AIMessage, fill any outstanding tool_call responses
             if outstanding_ids:
                 _flush_outstanding()
             # Fix empty content for tool-calling AIMessages
@@ -95,13 +121,12 @@ def format_messages(messages):
                 if tid:
                     outstanding_ids.add(tid)
 
-        elif isinstance(m, ToolMessage):
-            tid = getattr(m, "tool_call_id", None)
+        elif _is_tool_msg(m):
+            tid = _tool_call_id(m)
             if tid and tid in outstanding_ids:
-                cleaned.append(m)
+                cleaned.append(_to_tool_message(m))
                 outstanding_ids.discard(tid)
-                answered_ids.add(tid)
-            # Orphaned ToolMessage (no matching outstanding tool_call_id) — drop it
+            # Orphaned tool message — drop it silently
 
         else:
             # SystemMessage / HumanMessage
@@ -929,35 +954,27 @@ def tool_execution_node(state: AgentState) -> AgentState:
         try:
             if tool_call["name"] == "generate_and_test_custom_function":
                 result = generate_and_test_custom_function.invoke(tool_call)
-                new_messages.append({
-                    "role": "tool",
-                    "name": tool_call["name"],
-                    "content": result,
-                    "tool_call_id": tool_call["id"]
-                })
             elif tool_call["name"] == "execute_existing_function_with_params":
                 result = execute_existing_function_with_params.invoke(tool_call)
-                new_messages.append({
-                    "role": "tool",
-                    "name": tool_call["name"],
-                    "content": result,
-                    "tool_call_id": tool_call["id"]
-                })
             elif tool_call["name"] == "run_analysis_script":
                 result = run_analysis_script.invoke(tool_call)
-                new_messages.append({
-                    "role": "tool",
-                    "name": tool_call["name"],
-                    "content": result,
-                    "tool_call_id": tool_call["id"]
-                })
+            else:
+                result = __import__("json").dumps({"error": f"Unknown tool: {tool_call['name']}"})
+            new_messages.append(
+                ToolMessage(
+                    content=result,
+                    tool_call_id=tool_call["id"],
+                    name=tool_call["name"],
+                )
+            )
         except Exception as e:
-                new_messages.append({
-                    "role": "tool",
-                    "name": tool_call["name"],
-                    "content": f"Error: {str(e)}",
-                    "tool_call_id": tool_call["id"]
-                })
+            new_messages.append(
+                ToolMessage(
+                    content=f"Error: {str(e)}",
+                    tool_call_id=tool_call["id"],
+                    name=tool_call["name"],
+                )
+            )
                 
     return {"messages": new_messages, "bad_indices_per_column": bad_indices_per_column}
 

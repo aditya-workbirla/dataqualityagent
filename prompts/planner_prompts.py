@@ -56,6 +56,18 @@ You do NOT answer the question yourself. The plan is handed to an Execution Agen
 
 ---
 
+## IMPORTANT — HOW DATA COMPUTATIONS ARE EXECUTED
+
+For follow-up questions requiring data computation, the Execution Agent uses a single
+tool called `run_analysis_script`. It writes ONE Python script with the full DataFrame
+(`df`, all columns in scope) and assigns all answers to `RESULT = {{...}}`.
+
+This means ALL `generate_new` gaps are implemented together in ONE script — not as
+separate per-column function calls. Design your plan accordingly: consolidate related
+computations into as few gaps as possible.
+
+---
+
 ## USER'S FOLLOW-UP QUESTION
 
 "{user_question}"
@@ -93,16 +105,18 @@ For each step that requires a function, add on the next line:
 Rules for Status:
 - Use `existing` ONLY if the exact function name appears in the AVAILABLE FUNCTIONS list above.
 - Use `generate_new` for ANY computation that has no matching existing function.
-- When Status is `generate_new`, you MUST also include it in FUNCTION GAPS below with full spec.
+- ALL generate_new steps will be combined into ONE `run_analysis_script` call — the script has access to the full DataFrame with ALL columns.
 
 ### FUNCTION GAPS
 (skip this section entirely if MODE is KB_ONLY or CONVERSATIONAL)
 
-List every function marked `generate_new` above. For each one provide ALL four fields:
-- Gap N: `<exact_function_name>` — <one-line description>
-  → Signature: `def <exact_function_name>(series: pd.Series) -> dict:`
-  → Target column: `<exact column name from dataset>`
-  → Returns: <description of dict keys the function should return>
+List every computation marked `generate_new` above. ALL gaps will be resolved in a
+single `run_analysis_script` call — the script has the full `df` in scope.
+
+For each gap provide ALL three fields:
+- Gap N: `<descriptive_computation_name>` — <one-line description of what to compute>
+  → Target column: `<exact column name, or "multiple columns" / "all numeric columns">`
+  → Returns: <keys and types to include in RESULT — e.g. "top_feature: str, correlation: float">
 
 (write "- None" if no gaps)
 
@@ -118,6 +132,8 @@ List every function marked `generate_new` above. For each one provide ALL four f
 - No Python code
 - No answering the question — only planning
 - Reference actual column names from the dataset wherever possible
+- Do NOT include `→ Signature:` lines — the script tool accepts full df, not single-column functions
+- ALL generate_new gaps will be resolved in ONE script — do not list redundant gaps
 - If CONVERSATIONAL, skip EXECUTION STEPS and FUNCTION GAPS entirely and write:
     - Step 1: Answer directly from context — no computation needed
 """
