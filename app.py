@@ -675,6 +675,7 @@ with tab1:
                 rag_chunks_text = ""
                 existing_fns  = []   # {"name": str, "params": dict}
                 new_fns       = []   # {"name": str, "description": str}
+                final_ai_content = ""   # accumulates the last non-empty AIMessage text
 
                 for chunk in app.stream({"messages": [HumanMessage(content=prompt)]}, config, stream_mode="updates"):
                     for node_name, node_output in chunk.items():
@@ -732,6 +733,16 @@ with tab1:
                             label = f"🔧 Executing tool: `{', '.join(tool_names_set) or 'custom function'}`…"
                             icon  = "🔧"
 
+                        # ── Capture final analyst text from quality_analyst node ──
+                        if node_name == "quality_analyst":
+                            msgs = node_output.get("messages", [])
+                            for m in reversed(msgs):
+                                content = m.content if hasattr(m, "content") else m.get("content", "")
+                                # Only accept a real text answer — skip tool-call-only messages
+                                if content and not getattr(m, "tool_calls", None):
+                                    final_ai_content = content
+                                    break
+
                         chat_placeholder.markdown(f"{icon} **{label}**")
                         chat_status.update(label=f"{icon} {label}")
                         if node_output:
@@ -740,11 +751,23 @@ with tab1:
                 chat_status.update(label="✅ Done", state="complete", expanded=False)
                 chat_placeholder.empty()
 
-                ai_response = (
-                    follow_state["messages"][-1].content
-                    if follow_state and follow_state.get("messages")
-                    else "No response."
-                )
+                # ── Extract the final assistant reply ─────────────────────────
+                # Primary: captured directly from quality_analyst node output
+                # (avoids the problem where follow_state ends up pointing at
+                #  tool_execution ToolMessages instead of the analyst's answer)
+                if final_ai_content:
+                    ai_response = final_ai_content
+                elif follow_state and follow_state.get("messages"):
+                    # Fallback: scan ALL messages in the last node output
+                    # for the last non-empty AIMessage without tool_calls
+                    ai_response = "No response."
+                    for m in reversed(follow_state["messages"]):
+                        content = m.content if hasattr(m, "content") else m.get("content", "")
+                        if content and not getattr(m, "tool_calls", None):
+                            ai_response = content
+                            break
+                else:
+                    ai_response = "No response."
                 st.session_state["chat_history"].append({"role": "assistant", "content": ai_response})
 
                 # ── Persist execution log keyed to this assistant turn ────────
