@@ -36,6 +36,20 @@ def run_all_verified_functions(df: pd.DataFrame) -> Dict[str, Any]:
                 ts_col = col
                 break
 
+    # Safety: ensure column names are unique for group-by/aggregation operations
+    if df.columns.duplicated().any():
+        df = df.copy()
+        new_cols = []
+        counts = {}
+        for col in df.columns:
+            if col in counts:
+                counts[col] += 1
+                new_cols.append(f"{col}_{counts[col]}")
+            else:
+                counts[col] = 0
+                new_cols.append(col)
+        df.columns = new_cols
+
     numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
 
     # Execute functions on the full dataset
@@ -59,6 +73,10 @@ def run_all_verified_functions(df: pd.DataFrame) -> Dict[str, Any]:
                         valid_executions = 0
                         
                         for col in numeric_cols:
+                            # ── SAFETY: Skip the timestamp column itself ──────
+                            if col == ts_col:
+                                continue
+
                             p = dict(base_params)
                             p["column"] = col
                             res = func(df, p)
