@@ -250,8 +250,8 @@ with st.sidebar:
     try:
         with sqlite3.connect("database/app.db", timeout=5.0) as cp_conn:
             cp_cursor = cp_conn.cursor()
-            cp_cursor.execute("SELECT DISTINCT thread_id FROM checkpoints")
-            threads = [row[0] for row in cp_cursor.fetchall() if row[0] != "main_thread"]
+            cp_cursor.execute("SELECT thread_id FROM checkpoints WHERE thread_id != 'main_thread' GROUP BY thread_id ORDER BY MAX(checkpoint_id) DESC")
+            threads = [row[0] for row in cp_cursor.fetchall()]
     except Exception:
         threads = []
         
