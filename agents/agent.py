@@ -50,29 +50,69 @@ class AgentState(TypedDict):
 
 def format_messages(messages):
     """
-    Cleans up the LangGraph message state to strictly comply with LLM API's 
-    roles and turn-taking requirements (e.g., no orphaned tool messages).
+    Cleans up the LangGraph message state to strictly comply with LLM API's
+    roles and turn-taking requirements:
+
+    Rules enforced:
+    1. Every AIMessage with tool_calls MUST be followed by one ToolMessage per
+       tool_call_id before the next AIMessage.  If any tool_call_id is missing
+       a response we synthesise a placeholder ToolMessage so the API never
+       sees an un-answered tool_call.
+    2. Orphaned ToolMessages (no preceding AIMessage with tool_calls) are dropped.
+    3. AIMessage with tool_calls but empty content gets a filler string so the
+       API doesn't reject it.
     """
     cleaned = []
-    
+    # Set of tool_call_ids that have been answered by a ToolMessage
+    answered_ids: set = set()
+    # tool_call_ids that are still outstanding (from the last AIMessage with tool_calls)
+    outstanding_ids: set = set()
+
+    def _flush_outstanding():
+        """Insert synthetic ToolMessages for any un-answered tool_call_ids."""
+        for tid in list(outstanding_ids):
+            cleaned.append(
+                ToolMessage(
+                    content="(no result — tool call was not executed)",
+                    tool_call_id=tid,
+                )
+            )
+            answered_ids.add(tid)
+        outstanding_ids.clear()
+
     for m in messages:
         if isinstance(m, AIMessage):
-            # fix empty content issue for tool calls
-            if getattr(m, 'tool_calls', None) and not m.content:
-                m.content = 'Calling tool'
+            # Before appending a new AIMessage, ensure previous tool_calls are answered
+            if outstanding_ids:
+                _flush_outstanding()
+            # Fix empty content for tool-calling AIMessages
+            if getattr(m, "tool_calls", None) and not m.content:
+                m = m.copy(update={"content": "Calling tool"})
             cleaned.append(m)
+            # Track which tool_call_ids this message expects responses for
+            for tc in getattr(m, "tool_calls", []) or []:
+                tid = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+                if tid:
+                    outstanding_ids.add(tid)
+
         elif isinstance(m, ToolMessage):
-            # Check if previous message expects a tool message
-            if cleaned:
-                prev = cleaned[-1]
-                if isinstance(prev, AIMessage) and getattr(prev, 'tool_calls', None):
-                    cleaned.append(m)
-                elif isinstance(prev, ToolMessage):
-                    cleaned.append(m)
-                # If orphaned (e.g. after a standard AIMessage), drop it.
+            tid = getattr(m, "tool_call_id", None)
+            if tid and tid in outstanding_ids:
+                cleaned.append(m)
+                outstanding_ids.discard(tid)
+                answered_ids.add(tid)
+            # Orphaned ToolMessage (no matching outstanding tool_call_id) — drop it
+
         else:
+            # SystemMessage / HumanMessage
+            if outstanding_ids:
+                _flush_outstanding()
             cleaned.append(m)
-            
+
+    # Final flush in case the list ends with un-answered tool calls
+    if outstanding_ids:
+        _flush_outstanding()
+
     return cleaned
 
 def get_llm(timeout_seconds: float = 180.0):
@@ -706,46 +746,110 @@ def quality_analyst_node(state: AgentState) -> AgentState:
                 gaps_section = gaps_raw
 
         if gaps_section:
-            # Build a mandatory tool-call checklist from the gaps
-            # Each Gap line: "- Gap N: `fn_name` — description"
-            # Sub-lines:     "  → Target column: `col`"
-            #                "  → Signature: ..."
-            #                "  → Returns: ..."
-            gap_blocks = _re_plan.split(r"\n(?=- Gap\s+\d+)", gaps_section)
-            checklist_lines = [
-                "## 🔴 MANDATORY TOOL CALLS — generate_new functions",
-                "",
-                "The Planner identified functions that DO NOT EXIST yet. "
-                "You MUST call `generate_and_test_custom_function` for EACH one below "
-                "BEFORE answering the question. Do NOT skip any.",
-                "",
-            ]
-            for idx, block in enumerate(gap_blocks, 1):
-                block = block.strip()
-                if not block:
-                    continue
-                # Extract function name
-                fn_match = _re_plan.search(r"`([^`]+)`", block)
-                fn_name  = fn_match.group(1) if fn_match else f"gap_function_{idx}"
-                # Extract target column
-                col_match = _re_plan.search(r"Target column[:\s]+`([^`]+)`", block, _re_plan.IGNORECASE)
-                target_col = col_match.group(1) if col_match else "(see plan)"
-                # Extract returns hint
-                ret_match = _re_plan.search(r"Returns[:\s]+(.+)", block, _re_plan.IGNORECASE)
-                returns_hint = ret_match.group(1).strip() if ret_match else "dict of stats"
-                # Extract description (first line after Gap N: `fn`)
-                desc_match = _re_plan.search(r"`[^`]+`\s*[—–-]+\s*(.+)", block)
-                description = desc_match.group(1).strip() if desc_match else block.splitlines()[0]
+            # During follow-up turns (report exists) the only script tool available is
+            # run_analysis_script.  Build a single-call instruction that folds ALL gaps
+            # into ONE script (helper functions + combined RESULT dict).
+            is_followup = bool(state.get("report"))
 
+            gap_blocks = _re_plan.split(r"\n(?=- Gap\s+\d+)", gaps_section)
+
+            if is_followup:
+                # ── Script-based mandatory call (follow-up only) ──────────────
+                fn_specs = []
+                for idx, block in enumerate(gap_blocks, 1):
+                    block = block.strip()
+                    if not block:
+                        continue
+                    fn_match  = _re_plan.search(r"`([^`]+)`", block)
+                    fn_name   = fn_match.group(1) if fn_match else f"gap_fn_{idx}"
+                    col_match = _re_plan.search(r"Target column[:\s]+`([^`]+)`", block, _re_plan.IGNORECASE)
+                    target_col = col_match.group(1) if col_match else "df.columns[0]"
+                    ret_match  = _re_plan.search(r"Returns[:\s]+(.+)", block, _re_plan.IGNORECASE)
+                    returns_hint = ret_match.group(1).strip() if ret_match else "dict of stats"
+                    desc_match = _re_plan.search(r"`[^`]+`\s*[—–-]+\s*(.+)", block)
+                    description = desc_match.group(1).strip() if desc_match else block.splitlines()[0]
+                    fn_specs.append({
+                        "name": fn_name,
+                        "col": target_col,
+                        "desc": description,
+                        "returns": returns_hint,
+                    })
+
+                helper_lines = []
+                result_keys  = []
+                for spec in fn_specs:
+                    helper_lines.append(
+                        f'# {spec["desc"]}\n'
+                        f'def {spec["name"]}(df):\n'
+                        f'    # TODO: implement — target column: {spec["col"]}\n'
+                        f'    # Must return: {spec["returns"]}\n'
+                        f'    pass'
+                    )
+                    result_keys.append(f'    "{spec["name"]}": {spec["name"]}(df)')
+
+                example_script = (
+                    "\n\n".join(helper_lines)
+                    + "\n\nRESULT = {\n"
+                    + ",\n".join(result_keys)
+                    + "\n}"
+                )
+
+                checklist_lines = [
+                    "## 🔴 MANDATORY TOOL CALL — run_analysis_script",
+                    "",
+                    "The Planner identified computations that must be performed. "
+                    "You MUST make exactly ONE call to `run_analysis_script` that "
+                    "implements ALL of the logic below in a single script. "
+                    "Do NOT call `generate_and_test_custom_function` — it is NOT available.",
+                    "",
+                    f"**Script must cover {len(fn_specs)} computation(s):**",
+                ]
+                for spec in fn_specs:
+                    checklist_lines.append(f"  - `{spec['name']}`: {spec['desc']} (column: `{spec['col']}`)")
                 checklist_lines += [
-                    f"**Call {idx}: `{fn_name}`**",
-                    f"- target_column: `{target_col}`",
-                    f"- function_description: \"{description}\"",
-                    f"- code: write `def {fn_name}(series: pd.Series) -> dict:` "
-                      f"that returns `{{{returns_hint}}}`",
+                    "",
+                    "**Contract**: The script must end with `RESULT = {{...}}` "
+                    "containing JSON-serialisable values for all computations.",
+                    "",
+                    "**Skeleton** (fill in the actual logic):",
+                    "```python",
+                    example_script,
+                    "```",
+                ]
+                injection_parts.append("\n".join(checklist_lines))
+
+            else:
+                # ── Legacy single-column checklist (initial analysis only) ───
+                checklist_lines = [
+                    "## 🔴 MANDATORY TOOL CALLS — generate_new functions",
+                    "",
+                    "The Planner identified functions that DO NOT EXIST yet. "
+                    "You MUST call `generate_and_test_custom_function` for EACH one below "
+                    "BEFORE answering the question. Do NOT skip any.",
                     "",
                 ]
-            injection_parts.append("\n".join(checklist_lines))
+                for idx, block in enumerate(gap_blocks, 1):
+                    block = block.strip()
+                    if not block:
+                        continue
+                    fn_match = _re_plan.search(r"`([^`]+)`", block)
+                    fn_name  = fn_match.group(1) if fn_match else f"gap_function_{idx}"
+                    col_match = _re_plan.search(r"Target column[:\s]+`([^`]+)`", block, _re_plan.IGNORECASE)
+                    target_col = col_match.group(1) if col_match else "(see plan)"
+                    ret_match  = _re_plan.search(r"Returns[:\s]+(.+)", block, _re_plan.IGNORECASE)
+                    returns_hint = ret_match.group(1).strip() if ret_match else "dict of stats"
+                    desc_match = _re_plan.search(r"`[^`]+`\s*[—–-]+\s*(.+)", block)
+                    description = desc_match.group(1).strip() if desc_match else block.splitlines()[0]
+
+                    checklist_lines += [
+                        f"**Call {idx}: `{fn_name}`**",
+                        f"- target_column: `{target_col}`",
+                        f"- function_description: \"{description}\"",
+                        f"- code: write `def {fn_name}(series: pd.Series) -> dict:` "
+                          f"that returns `{{{returns_hint}}}`",
+                        "",
+                    ]
+                injection_parts.append("\n".join(checklist_lines))
 
         if rag_chunks:
             injection_parts.append(
