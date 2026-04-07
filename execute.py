@@ -6,8 +6,8 @@ It is a complete, runnable Python script that reproduces ALL
 function calls made during the current session in order.
 
 Dataset: <path to your dataset file>
-Shape  : unknown
-Columns: unknown
+Shape  : 278 rows × 18 columns
+Columns: date_day, 1st Ring Head Pressure(kg/cm2)_A, 2nd Ring Head Pressure(kg/cm2)_A, 3rd Ring Head Pressure(kg/cm2)_A, 4th Ring Head Pressure(kg/cm2)_A, Dosing Rate(L/hr)_A, Soda Ash Dosing Rate(L/hr)_A, Blower Discharge Pressure(mmwc)_A, Scrubber_Inlet_Pressure_A, Scrubber_Outlet_Pressure_A, Blower_Inlet_Pressure_A, Slurry Mass Flow Rate(kg/hr)(T06)_A, Slurry Density(kg/m3)(T06)_A, Heater Steam Pressure(kg/cm2)_A, Heater Temperature(C)_A, pH_A, EDTA(gpl)_A, Outlet H2S Concentration(ppm)
 """
 
 import pandas as pd
@@ -19,9 +19,10 @@ from typing import Dict, Any, List, Optional
 
 # ─────────────────────────────────────────────────────────────────
 # DATASET LOADING
-# Replace the path below with the actual path to your dataset.
 # ─────────────────────────────────────────────────────────────────
-DATASET_PATH = os.path.join(os.path.dirname(__file__), "data/VIL_P2_agentdata.xlsx")
+# _PROJECT_ROOT is the directory containing execute.py
+_PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+DATASET_PATH = os.path.join(_PROJECT_ROOT, "data/sample_faulty_data.csv")
 
 def load_dataset(path: str) -> pd.DataFrame:
     """Load dataset from CSV or Excel, auto-detecting format."""
@@ -32,7 +33,164 @@ def load_dataset(path: str) -> pd.DataFrame:
 df = load_dataset(DATASET_PATH)
 print(f"✅ Dataset loaded: {len(df)} rows × {len(df.columns)} columns")
 
-# No functions have been executed in this session yet.
+# ─────────────────────────────────────────────────────────────────
+# FUNCTION DEFINITIONS
+# ─────────────────────────────────────────────────────────────────
+
+# ------------------------------------------------------------
+# Function : get_column_dtypes_v2
+# Kind     : generated
+# Desc     : Retrieve the dtype of each column in the dataset.
+# ------------------------------------------------------------
+def get_column_dtypes_v2(series: pd.Series) -> dict:
+    dtype_str = str(series.dtype)
+    return {"dtypes": {series.name if series.name is not None else "column": dtype_str}}
+
+
+# ------------------------------------------------------------
+# Function : format_column_dtypes_for_output_v2
+# Kind     : generated
+# Desc     : Format column dtypes into a structure suitable for tabular display.
+# ------------------------------------------------------------
+def format_column_dtypes_for_output_v2(series):
+    import pandas as pd
+    dtypes_dict = series
+    schema = []
+    for col, dt in dtypes_dict.items():
+        schema.append({"column": col, "dtype": str(dt)})
+    return {"schema": schema}
+
+
+# ------------------------------------------------------------
+# Function : compute_correlations_with_target_v2
+# Kind     : generated
+# Desc     : Compute Pearson correlations between pH_A and all other numeric columns.
+# ------------------------------------------------------------
+def compute_correlations_with_target_v2(series: pd.Series) -> dict:
+    target_col = 'pH_A'
+
+    # Expecting a Series corresponding to the target column itself
+    if not isinstance(series, pd.Series):
+        return {"error": "Input must be a pandas Series"}
+
+    if series.name != target_col:
+        return {"error": f"Input Series must be the target column '{target_col}'"}
+
+    # A single Series cannot have correlations with other columns by itself
+    # Return empty correlations but keep structure JSON-serialisable
+    return {
+        "target": target_col,
+        "correlations": {}
+    }
+
+
+# ------------------------------------------------------------
+# Function : rank_correlations_with_target
+# Kind     : generated
+# Desc     : Rank features by absolute correlation with pH_A.
+# ------------------------------------------------------------
+def rank_correlations_with_target(series):
+    import pandas as pd
+    # 'series' will be a dict-like object with key 'correlations'
+    corrs = series.get('correlations', {})
+    if not corrs:
+        return {"error": "No correlations provided"}
+    corr_items = [
+        {"feature": k, "correlation": float(v), "abs_correlation": float(abs(v))}
+        for k, v in corrs.items()
+    ]
+    df_corr = pd.DataFrame(corr_items)
+    df_corr = df_corr.sort_values(by='abs_correlation', ascending=False).reset_index(drop=True)
+    return {"ranked": df_corr.to_dict(orient='records')}
+
+
+# ------------------------------------------------------------
+# Function : compute_correlations_with_target_v3
+# Kind     : generated
+# Desc     : Compute Pearson correlations between pH_A and all other numeric columns in the dataset.
+# ------------------------------------------------------------
+def compute_correlations_with_target_v3(series):
+    import pandas as pd
+    df = series  # here, 'series' will actually be the full DataFrame
+    target_col = 'pH_A'
+    if not hasattr(df, 'columns'):
+        return {"error": "Input is not a DataFrame"}
+    if target_col not in df.columns:
+        return {"error": f"Target column {target_col} not in DataFrame"}
+    numeric_df = df.select_dtypes(include=['number'])
+    if target_col not in numeric_df.columns:
+        return {"error": f"Target column {target_col} is not numeric"}
+    corrs = numeric_df.corr(method='pearson')[target_col].drop(labels=[target_col])
+    return {"target": target_col, "correlations": corrs.to_dict()}
+
+
+# ─────────────────────────────────────────────────────────────────
+# EXECUTION  (run all functions in the order they were invoked)
+# ─────────────────────────────────────────────────────────────────
+
+def run_all(df: pd.DataFrame) -> Dict[str, Any]:
+    """Runs every function executed during the agent session."""
+    results: Dict[str, Any] = {}
+
+    # ── Call 1: get_column_dtypes_v2 ──
+    try:
+        series = df["pH_A"]
+        result_call_01_get_column_dtypes_v2 = get_column_dtypes_v2(series)
+        print(f"  [1] get_column_dtypes_v2('pH_A'): {result_call_01_get_column_dtypes_v2}")
+        results["call_01_get_column_dtypes_v2"] = result_call_01_get_column_dtypes_v2
+    except Exception as _e:
+        print(f"  [1] get_column_dtypes_v2 FAILED: {_e}")
+        results["call_01_get_column_dtypes_v2"] = {"error": str(_e)}
+
+    # ── Call 2: format_column_dtypes_for_output_v2 ──
+    try:
+        series = df["pH_A"]
+        result_call_02_format_column_dtypes_for_output_v2 = format_column_dtypes_for_output_v2(series)
+        print(f"  [2] format_column_dtypes_for_output_v2('pH_A'): {result_call_02_format_column_dtypes_for_output_v2}")
+        results["call_02_format_column_dtypes_for_output_v2"] = result_call_02_format_column_dtypes_for_output_v2
+    except Exception as _e:
+        print(f"  [2] format_column_dtypes_for_output_v2 FAILED: {_e}")
+        results["call_02_format_column_dtypes_for_output_v2"] = {"error": str(_e)}
+
+    # ── Call 3: compute_correlations_with_target_v2 ──
+    try:
+        series = df["pH_A"]
+        result_call_03_compute_correlations_with_target_v2 = compute_correlations_with_target_v2(series)
+        print(f"  [3] compute_correlations_with_target_v2('pH_A'): {result_call_03_compute_correlations_with_target_v2}")
+        results["call_03_compute_correlations_with_target_v2"] = result_call_03_compute_correlations_with_target_v2
+    except Exception as _e:
+        print(f"  [3] compute_correlations_with_target_v2 FAILED: {_e}")
+        results["call_03_compute_correlations_with_target_v2"] = {"error": str(_e)}
+
+    # ── Call 4: rank_correlations_with_target ──
+    try:
+        series = df["pH_A"]
+        result_call_04_rank_correlations_with_target = rank_correlations_with_target(series)
+        print(f"  [4] rank_correlations_with_target('pH_A'): {result_call_04_rank_correlations_with_target}")
+        results["call_04_rank_correlations_with_target"] = result_call_04_rank_correlations_with_target
+    except Exception as _e:
+        print(f"  [4] rank_correlations_with_target FAILED: {_e}")
+        results["call_04_rank_correlations_with_target"] = {"error": str(_e)}
+
+    # ── Call 5: compute_correlations_with_target_v3 ──
+    try:
+        series = df["pH_A"]
+        result_call_05_compute_correlations_with_target_v3 = compute_correlations_with_target_v3(series)
+        print(f"  [5] compute_correlations_with_target_v3('pH_A'): {result_call_05_compute_correlations_with_target_v3}")
+        results["call_05_compute_correlations_with_target_v3"] = result_call_05_compute_correlations_with_target_v3
+    except Exception as _e:
+        print(f"  [5] compute_correlations_with_target_v3 FAILED: {_e}")
+        results["call_05_compute_correlations_with_target_v3"] = {"error": str(_e)}
+
+    return results
+
 
 if __name__ == "__main__":
-    print("No functions to run.")
+    print("\n" + "=" * 60)
+    print("  DataQA Agent — Session Execution Replay")
+    print("=" * 60 + "\n")
+    all_results = run_all(df)
+    print("\n" + "─" * 60)
+    print(f"  ✅ {len(all_results)} function calls completed.")
+    print("─" * 60)
+    print(json.dumps(all_results, indent=2, default=str))

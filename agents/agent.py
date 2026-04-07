@@ -6,7 +6,7 @@ from langchain_openai import ChatOpenAI, AzureChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 import operator
 from operations.predefined import run_all_verified_functions
-from agents.tools import generate_and_test_custom_function, set_current_df, execute_existing_function_with_params
+from agents.tools import generate_and_test_custom_function, set_current_df, execute_existing_function_with_params, run_analysis_script
 from prompts.knowledge_agent_prompts import (
     get_process_prompt,
     get_physics_prompt,
@@ -625,7 +625,12 @@ def quality_analyst_node(state: AgentState) -> AgentState:
     chat_mode = state.get("chat_mode", "").upper()
     if chat_mode in ("KB_ONLY", "CONVERSATIONAL"):
         llm_with_tools = llm   # No tools — pure reasoning/KB answer
+    elif state.get("report"):
+        # Follow-up chat turn: use script-based full-df tool so LLM can write
+        # multi-column, multi-step analysis scripts (RESULT = ... contract)
+        llm_with_tools = llm.bind_tools([run_analysis_script, execute_existing_function_with_params])
     else:
+        # Initial analysis run: use single-column function generator
         llm_with_tools = llm.bind_tools([generate_and_test_custom_function, execute_existing_function_with_params])
     
     # Fetch parameters for Group 2 and 3 functions so LLM knows what to call
@@ -834,9 +839,14 @@ def tool_execution_node(state: AgentState) -> AgentState:
                     "content": result,
                     "tool_call_id": tool_call["id"]
                 })
-                
-                # We optionally track metrics from the custom tool result if we want, 
-                # but for now we just feed the LLM the JSON string backward.
+            elif tool_call["name"] == "run_analysis_script":
+                result = run_analysis_script.invoke(tool_call)
+                new_messages.append({
+                    "role": "tool",
+                    "name": tool_call["name"],
+                    "content": result,
+                    "tool_call_id": tool_call["id"]
+                })
         except Exception as e:
                 new_messages.append({
                     "role": "tool",

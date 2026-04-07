@@ -716,6 +716,14 @@ with tab1:
                                         "auto_corrected": auto_fixed,
                                         "tester_attempts": tester_attempts,
                                     })
+                                elif raw_name == "run_analysis_script":
+                                    auto_corrected = res.get("script_auto_corrected", False)
+                                    new_fns.append({
+                                        "name": "analysis_script",
+                                        "description": res.get("question_summary", "Full-df analysis script"),
+                                        "auto_corrected": auto_corrected,
+                                        "tester_attempts": res.get("tester_attempts", 1),
+                                    })
                                 elif raw_name == "execute_existing_function_with_params":
                                     existing_fns.append({
                                         "name": res.get("function_name", "unknown"),

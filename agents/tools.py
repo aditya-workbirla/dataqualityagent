@@ -201,3 +201,73 @@ def execute_existing_function_with_params(function_name: str, params: dict) -> s
             "success": False,
             "error": str(e),
         })
+
+
+@tool
+def run_analysis_script(script: str, question_summary: str = "") -> str:
+    """
+    Write and execute a COMPLETE Python analysis script against the full DataFrame.
+
+    Use this tool for ANY follow-up question that requires data computation,
+    statistics, filtering, or multi-column analysis.
+
+    The script:
+      - Receives `df` (the complete dataset — ALL columns are available)
+      - May define helper functions and chain multiple operations together
+      - MUST assign the final answer to:  RESULT = <dict or list>
+      - RESULT must be JSON-serialisable (use float()/int() for numpy scalars,
+        .to_dict() or .tolist() instead of DataFrames/arrays)
+
+    The Code Testing Agent will automatically test and fix the script up to 3 times.
+    On success, execute.py is completely rewritten with this script (previous
+    session content is removed).
+
+    Parameters
+    ----------
+    script          : Full Python script (may include helper functions).
+                      Must end with RESULT = {...} or RESULT = [...]
+    question_summary: Short label for the question (used in execute.py header).
+    """
+    global _CURRENT_DF
+    if _CURRENT_DF is None:
+        return "Error: No dataframe loaded. Please upload a dataset first."
+
+    from agents.code_tester import test_and_fix_script
+    test_result = test_and_fix_script(
+        script=script,
+        df=_CURRENT_DF,
+        question=question_summary,
+        verbose=True,
+    )
+
+    if not test_result.success:
+        return json.dumps({
+            "success": False,
+            "question_summary": question_summary,
+            "error": test_result.error,
+            "tester_attempts": test_result.attempts,
+            "message": (
+                "The Code Testing Agent could not produce a working script after "
+                f"{test_result.attempts} attempt(s). Please review the error and "
+                "try a different approach."
+            ),
+        }, default=str)
+
+    # ── Rewrite execute.py with the verified script ───────────────────────
+    try:
+        from agents.execute_writer import write_prompt_script
+        write_prompt_script(
+            script=test_result.final_code,
+            question=question_summary,
+            df=_CURRENT_DF,
+        )
+    except Exception as _ew_err:
+        print(f"⚠️  execute.py writer failed (non-fatal): {_ew_err}")
+
+    return json.dumps({
+        "success": True,
+        "question_summary": question_summary,
+        "script_auto_corrected": test_result.final_code != script,
+        "tester_attempts": test_result.attempts,
+        "result": test_result.result,
+    }, default=str)
