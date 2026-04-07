@@ -770,76 +770,108 @@ def quality_analyst_node(state: AgentState) -> AgentState:
             if gaps_raw and "none" not in gaps_raw.lower():
                 gaps_section = gaps_raw
 
+        # ── Fallback: plan references run_analysis_script in steps but no FUNCTION GAPS ──
+        # e.g. "→ Function: run_analysis_script | Status: generate_new"
+        # In this case synthesise a minimal gaps_section from EXECUTION STEPS
+        if not gaps_section and state.get("report"):
+            steps_match = _re_plan.search(
+                r"###\s*EXECUTION STEPS\s*\n(.*?)(?=\n###|\Z)",
+                chat_plan, _re_plan.DOTALL | _re_plan.IGNORECASE,
+            )
+            if steps_match:
+                steps_text = steps_match.group(1)
+                # Any step that is generate_new and NOT already an existing DB function
+                # needs to be treated as a gap that run_analysis_script must handle
+                if _re_plan.search(r"generate_new", steps_text, _re_plan.IGNORECASE):
+                    # Extract step descriptions to use as gap descriptions
+                    step_descs = _re_plan.findall(r"- Step \d+:\s*(.+)", steps_text)
+                    if step_descs:
+                        col_hint = ""
+                        cols_match = _re_plan.search(
+                            r"Columns involved:\s*(.+)", chat_plan, _re_plan.IGNORECASE
+                        )
+                        if cols_match:
+                            col_hint = cols_match.group(1).strip()
+                        gaps_section = "\n".join(
+                            f"- Gap {i}: `computation_{i}` — {desc.strip()}\n"
+                            f"  → Target column: {col_hint or 'relevant column(s)'}\n"
+                            f"  → Returns: relevant statistics as float values"
+                            for i, desc in enumerate(step_descs, 1)
+                        )
+
         if gaps_section:
             # During follow-up turns (report exists) the only script tool available is
-            # run_analysis_script.  Build a single-call instruction that folds ALL gaps
-            # into ONE script (helper functions + combined RESULT dict).
+            # run_analysis_script. Build a direct instruction for the LLM to write
+            # and call the script itself — do NOT use a skeleton with pass stubs.
             is_followup = bool(state.get("report"))
 
+            # Parse gap blocks — handle both backtick-wrapped and plain names
             gap_blocks = _re_plan.split(r"\n(?=- Gap\s+\d+)", gaps_section)
 
             if is_followup:
-                # ── Script-based mandatory call (follow-up only) ──────────────
-                fn_specs = []
+                # Build a clear human-readable list of what the script must compute
+                gap_descriptions = []
                 for idx, block in enumerate(gap_blocks, 1):
                     block = block.strip()
                     if not block:
                         continue
-                    fn_match  = _re_plan.search(r"`([^`]+)`", block)
-                    fn_name   = fn_match.group(1) if fn_match else f"gap_fn_{idx}"
-                    col_match = _re_plan.search(r"Target column[:\s]+`([^`]+)`", block, _re_plan.IGNORECASE)
-                    target_col = col_match.group(1) if col_match else "df.columns[0]"
-                    ret_match  = _re_plan.search(r"Returns[:\s]+(.+)", block, _re_plan.IGNORECASE)
-                    returns_hint = ret_match.group(1).strip() if ret_match else "dict of stats"
-                    desc_match = _re_plan.search(r"`[^`]+`\s*[—–-]+\s*(.+)", block)
-                    description = desc_match.group(1).strip() if desc_match else block.splitlines()[0]
-                    fn_specs.append({
-                        "name": fn_name,
-                        "col": target_col,
-                        "desc": description,
-                        "returns": returns_hint,
-                    })
+                    # Extract name — try backtick first, then plain "Gap N: name —"
+                    fn_match = _re_plan.search(r"`([^`]+)`", block)
+                    if fn_match:
+                        fn_name = fn_match.group(1)
+                    else:
+                        plain_match = _re_plan.search(r"Gap\s+\d+:\s*(\S+)", block)
+                        fn_name = plain_match.group(1) if plain_match else f"computation_{idx}"
 
-                helper_lines = []
-                result_keys  = []
-                for spec in fn_specs:
-                    helper_lines.append(
-                        f'# {spec["desc"]}\n'
-                        f'def {spec["name"]}(df):\n'
-                        f'    # TODO: implement — target column: {spec["col"]}\n'
-                        f'    # Must return: {spec["returns"]}\n'
-                        f'    pass'
+                    # Extract target column — with or without backticks
+                    col_match = _re_plan.search(
+                        r"Target column[:\s]+`?([^`\n]+?)`?\s*$",
+                        block, _re_plan.IGNORECASE | _re_plan.MULTILINE
                     )
-                    result_keys.append(f'    "{spec["name"]}": {spec["name"]}(df)')
+                    target_col = col_match.group(1).strip() if col_match else "relevant column(s)"
 
-                example_script = (
-                    "\n\n".join(helper_lines)
-                    + "\n\nRESULT = {\n"
-                    + ",\n".join(result_keys)
-                    + "\n}"
-                )
+                    # Extract returns hint
+                    ret_match = _re_plan.search(r'Returns[:\s]+"?([^"\n]+)"?', block, _re_plan.IGNORECASE)
+                    returns_hint = ret_match.group(1).strip() if ret_match else "relevant statistics"
+
+                    # Extract description
+                    desc_match = _re_plan.search(r"(?:`[^`]+`|Gap\s+\d+:\s*\S+)\s*[—–-]+\s*(.+)", block)
+                    description = desc_match.group(1).strip() if desc_match else block.splitlines()[0].strip()
+
+                    gap_descriptions.append(
+                        f"  {idx}. **{fn_name}**: {description}\n"
+                        f"     - Column(s): `{target_col}`\n"
+                        f"     - Must produce in RESULT: {returns_hint}"
+                    )
 
                 checklist_lines = [
-                    "## 🔴 MANDATORY TOOL CALL — run_analysis_script",
+                    "## 🔴 MANDATORY: Call `run_analysis_script` NOW",
                     "",
-                    "The Planner identified computations that must be performed. "
-                    "You MUST make exactly ONE call to `run_analysis_script` that "
-                    "implements ALL of the logic below in a single script. "
-                    "Do NOT call `generate_and_test_custom_function` — it is NOT available.",
+                    "You MUST immediately call the `run_analysis_script` tool with a complete "
+                    "Python script that performs ALL of the following computations. "
+                    "Do NOT just describe the answer — CALL THE TOOL.",
                     "",
-                    f"**Script must cover {len(fn_specs)} computation(s):**",
-                ]
-                for spec in fn_specs:
-                    checklist_lines.append(f"  - `{spec['name']}`: {spec['desc']} (column: `{spec['col']}`)")
-                checklist_lines += [
+                    "**What the script must compute:**",
                     "",
-                    "**Contract**: The script must end with `RESULT = {{...}}` "
-                    "containing JSON-serialisable values for all computations.",
+                ] + gap_descriptions + [
                     "",
-                    "**Skeleton** (fill in the actual logic):",
-                    "```python",
-                    example_script,
+                    "**How to write the script:**",
+                    "- `df` is already in scope — use it directly (do NOT reload the dataset)",
+                    "- All standard imports (pd, np, json) are pre-available",
+                    "- Assign all computed values to `RESULT = {...}` at the end",
+                    "- Use `float()` / `int()` for numpy scalars — NEVER raw numpy types",
+                    "- You may define helper functions inside the script",
+                    "",
+                    "**Example structure:**",
                     "```",
+                    "col = '1st Ring Head Pressure(kg/cm2)_A'",
+                    "mean_val = float(df[col].mean())",
+                    "std_val = float(df[col].std())",
+                    "RESULT = {'mean': mean_val, 'std': std_val, 'lower_2sigma': mean_val - 2*std_val, 'upper_2sigma': mean_val + 2*std_val}",
+                    "```",
+                    "",
+                    "Call `run_analysis_script` with `script=<your complete script>` and "
+                    f"`question_summary=\"{state.get('messages', [{}])[-1].content[:80] if state.get('messages') else 'analysis'}\"`",
                 ]
                 injection_parts.append("\n".join(checklist_lines))
 
@@ -896,8 +928,10 @@ def quality_analyst_node(state: AgentState) -> AgentState:
         elif chat_mode == "DATA_ONLY":
             mode_instruction = (
                 "## ⚠️ MODE: DATA_ONLY\n"
-                "Answer using ONLY data computations (run functions / generate custom checks). "
-                "Do NOT reference the knowledge base — focus purely on what the data shows."
+                "Answer using ONLY data computations. You MUST call `run_analysis_script` "
+                "to compute the answer from the data — do NOT just describe what you would do. "
+                "Write a complete Python script with `df` in scope that ends with `RESULT = {{...}}`. "
+                "Do NOT reference the knowledge base."
             )
         elif chat_mode == "CONVERSATIONAL":
             mode_instruction = (
